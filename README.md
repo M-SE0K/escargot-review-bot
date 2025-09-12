@@ -117,6 +117,46 @@ python -m escargot_review_bot.main
 uvicorn escargot_review_bot.api:app --host 0.0.0.0 --port 8000
 ```
 
+## Operations (systemd + journald)
+
+In production, the service is managed by systemd and logs are viewed via journald. Detailed configuration (service user/group, paths, EnvironmentFile, ports) and any security‑sensitive values are maintained in external operations documentation and are not tracked in this repository.
+
+1) Unit file location
+- The unit is assumed to be provisioned at `/etc/systemd/system/escargot-review-bot.service`. Its contents are intentionally not documented here.
+
+2) Enable and start
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now escargot-review-bot
+```
+
+3) Restart / stop / status
+```bash
+sudo systemctl restart escargot-review-bot
+sudo systemctl stop escargot-review-bot
+sudo systemctl status escargot-review-bot --no-pager
+```
+
+4) Logs (journald)
+```bash
+# Jump to the end
+journalctl -u escargot-review-bot -e
+
+# Follow live, starting with the last 200 lines
+journalctl -u escargot-review-bot -f -n 200
+
+# Current boot only
+journalctl -u escargot-review-bot -b
+```
+
+5) Applying updates (example)
+```bash
+cd /ABS/PATH/TO/escargot-review-bot
+source /ABS/PATH/TO/venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart escargot-review-bot
+```
+
 ### Environment variables (.env)
 | Key | Default | Description |
 |---|---:|---|
