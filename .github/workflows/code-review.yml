@@ -1,0 +1,121 @@
+name: Automated Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  # 자신의 레포에서만 실행되도록 조건 추가
+  workflow_dispatch:  # 수동 실행도 가능
+
+jobs:
+  review:
+    # 자신의 레포에서만 실행되도록 조건 추가
+    if: github.repository == 'mse0k/escargot' || github.repository == 'mse0k/escargot-review-bot'
+    runs-on: self-hosted  # Self-hosted runner 사용 시
+    # runs-on: ubuntu-latest  # GitHub-hosted runner 사용 시 (서버가 외부에 있는 경우)
+    
+    permissions:
+      pull-requests: write
+      contents: read
+    
+    steps:
+      - name: Compute diff range
+        id: diff_range
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const event = context.payload;
+            let baseSha, headSha;
+            
+            if (context.eventName === 'pull_request') {
+              if (event.action === 'opened' || event.action === 'reopened') {
+                // Full review: review entire PR
+                baseSha = event.pull_request.base.sha;
+                headSha = event.pull_request.head.sha;
+              } else if (event.action === 'synchronize') {
+                // Incremental review: only review the new push
+                baseSha = event.before;
+                headSha = event.pull_request.head.sha;
+              }
+            }
+            
+            core.setOutput('base_sha', baseSha);
+            core.setOutput('head_sha', headSha);
+            core.setOutput('pr_number', event.pull_request.number);
+            
+            console.log(`Review range: ${baseSha}..${headSha} (PR #${event.pull_request.number})`);
+      
+      - name: Call review API
+        id: review
+        env:
+          REVIEW_SERVER_URL: ${{ secrets.REVIEW_SERVER_URL || 'http://localhost:8001' }}
+        run: |
+          echo "Calling review API at $REVIEW_SERVER_URL/review"
+          
+          response=$(curl -s -w "\n%{http_code}" -X POST "$REVIEW_SERVER_URL/review" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"base_sha\": \"${{ steps.diff_range.outputs.base_sha }}\",
+              \"head_sha\": \"${{ steps.diff_range.outputs.head_sha }}\",
+              \"pull_request_number\": ${{ steps.diff_range.outputs.pr_number }}
+            }")
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          if [ "$http_code" -ne 200 ]; then
+            echo "❌ API 호출 실패 (HTTP $http_code)"
+            echo "$body"
+            exit 1
+          fi
+          
+          echo "$body" > review.json
+          comments_count=$(echo "$body" | jq '.comments | length')
+          echo "comments_count=$comments_count" >> $GITHUB_OUTPUT
+          
+          if [ "$comments_count" -eq 0 ]; then
+            echo "✅ 리뷰 완료: 댓글이 없습니다."
+          else
+            echo "✅ 리뷰 완료: $comments_count개의 댓글 생성됨"
+          fi
+      
+      - name: Post review comments
+        if: steps.review.outputs.comments_count > 0
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const reviewData = JSON.parse(fs.readFileSync('review.json', 'utf8'));
+            const comments = reviewData.comments || [];
+            
+            console.log(`Posting ${comments.length} review comments...`);
+            
+            let successCount = 0;
+            let errorCount = 0;
+            
+            for (const comment of comments) {
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.issue.number,
+                  commit_id: comment.commit_id,
+                  path: comment.path,
+                  line: comment.line,
+                  side: comment.side,
+                  body: comment.body
+                });
+                
+                successCount++;
+                console.log(`✅ Posted comment on ${comment.path}:${comment.line}`);
+                
+                // Rate limit 방지를 위한 딜레이 (200ms)
+                await new Promise(resolve => setTimeout(resolve, 200));
+              } catch (error) {
+                errorCount++;
+                console.error(`❌ Failed to post comment on ${comment.path}:${comment.line}`, error.message);
+              }
+            }
+            
+            console.log(`\n📊 결과: ${successCount}개 성공, ${errorCount}개 실패`);
+

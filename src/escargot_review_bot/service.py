@@ -19,6 +19,7 @@ from escargot_review_bot.domain.schemas import (
 )
 from escargot_review_bot.prompts.defect import SYSTEM_PROMPT_DEFECT
 from escargot_review_bot.prompts.refactor import SYSTEM_PROMPT_REFACTOR
+from escargot_review_bot.prompts.compiler import SYSTEM_PROMPT_COMPILER
 
 
 logger = get_logger("review-bot.service")
@@ -444,10 +445,11 @@ def _run_review_pass(
 
 
 def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
-    """End-to-end review across diff: two passes per hunk, aggregate comments.
+    """End-to-end review across diff: three passes per hunk, aggregate comments.
 
-    Fetches upstream, builds unified diff, runs defect then refactor passes per
-    hunk, applies confidence/alignment checks, and returns GitHub comments.
+    Fetches upstream, builds unified diff, runs defect, refactor, and compiler
+    optimization passes per hunk, applies confidence/alignment checks, and returns
+    GitHub comments.
     """
     logger.info(f"Start review PR=#{request.pull_request_number} {request.base_sha}..{request.head_sha}")
 
@@ -516,7 +518,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             all_github_comments.extend(defect_comments)
 
             # Pass 2: refactors (skip any accepted defect IDs to avoid duplicates)
-            refactor_comments, _ = _run_review_pass(
+            refactor_comments, accepted_refactor_ids = _run_review_pass(
                 model_type='refactor',
                 system_prompt=SYSTEM_PROMPT_REFACTOR,
                 file_path=file_path,
@@ -528,6 +530,21 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 skip_ids=accepted_defect_ids,
             )
             all_github_comments.extend(refactor_comments)
+
+            # Pass 3: compiler optimization hints (skip IDs from defect and refactor passes)
+            accepted_previous_ids = accepted_defect_ids | accepted_refactor_ids
+            compiler_comments, _ = _run_review_pass(
+                model_type='compiler',
+                system_prompt=SYSTEM_PROMPT_COMPILER,
+                file_path=file_path,
+                hunk=hunk,
+                mappings=mappings,
+                mapping_dict=mapping_dict,
+                head_sha=request.head_sha,
+                head_blob_cache=head_blob_cache,
+                skip_ids=accepted_previous_ids,
+            )
+            all_github_comments.extend(compiler_comments)
 
     logger.info(f"Generated {len(all_github_comments)} comments in total.")
     return all_github_comments

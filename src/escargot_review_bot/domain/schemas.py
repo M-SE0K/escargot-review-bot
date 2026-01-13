@@ -2,6 +2,7 @@ from typing import Optional, Literal
 from pydantic import BaseModel
 
 
+# Github Actios에서 POST /revi
 class ReviewRequest(BaseModel):
     base_sha: str
     head_sha: str
