@@ -1,0 +1,357 @@
+{
+  "results": [
+    {
+      "experiment": 1,
+      "base_sha": "experiment/base-iterator-test-1",
+      "head_sha": "experiment/review-iterator-test-1",
+      "comments_count": 6,
+      "comments": [
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Replace `IteratorMapData* closureData = reinterpret_cast<IteratorMapData*>(data);` with `auto* closureData = reinterpret_cast<IteratorData*>(data);`. This improves readability by using a more descriptive type and avoids potential confusion from the old name.",
+          "commit_id": "experiment/review-iterator-test-1",
+          "line": 148,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Rename `Value mapper` to `Value callback` for consistency with the field name in `IteratorData`. This improves readability by aligning variable names with the structure's fields.",
+          "commit_id": "experiment/review-iterator-test-1",
+          "line": 150,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Refactor the `while` loop in `iteratorFilterClosure` to use a tiny local guard for early returns. This keeps the loop structure clear and avoids repeated `iterated->m_done = true;` assignments.",
+          "commit_id": "experiment/review-iterator-test-1",
+          "line": 196,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Introduce a localized RAII guard in `builtinIteratorReduce` to encapsulate `iterated->m_done = true;` and `return accumulator;` within the loop's early exit paths. This centralizes teardown around the main path, improving exception-safety.",
+          "commit_id": "experiment/review-iterator-test-1",
+          "line": 299,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Hoist the `ObjectPropertyName` construction for 'reduce' to improve readability and avoid duplication. Change `auto ObjectPropertyName(strings->reduce)` to `const auto reduceProp = ObjectPropertyName(strings->reduce);`. This keeps the code DRY without altering semantics.",
+          "commit_id": "experiment/review-iterator-test-1",
+          "line": 458,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Factor out a tiny helper for 'filter' property creation to clarify intent and reduce duplication. Introduce `auto createFilterProperty = [&](ExecutionState& state) { ... };`. Keep the helper local to this function.",
+          "commit_id": "experiment/review-iterator-test-1",
+          "line": 456,
+          "side": "RIGHT"
+        }
+      ]
+    },
+    {
+      "experiment": 2,
+      "base_sha": "experiment/base-iterator-test-2",
+      "head_sha": "experiment/review-iterator-test-2",
+      "comments_count": 17,
+      "comments": [
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Remove the `#include \"runtime/IteratorObject.h\"` line as it's no longer needed due to the removal of `IteratorObject`. This improves compile-time by reducing unnecessary dependencies.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 25,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Refactor the `while` loop into a tiny local helper `performStep` to encapsulate the spec steps of acquiring `value`, calling `predicate`, and handling errors. This improves readability by separating each spec step visibly.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 288,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Introduce a tiny RAII guard around the loop to ensure `counter++` happens on all exits, even when an abrupt completion closes the iterator early. This keeps increment logic co-located with the loop and avoids off-by-one errors.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 303,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "This error handling block `if (!O.isObject())` represents an exception path. Marking this branch with `[[unlikely]]` (or `UNLIKELY()`) allows the compiler to optimize instruction scheduling for the success path.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 262,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "This error handling block `if (!predicate.isCallable())` represents an exception path. Marking this branch with `[[unlikely]]` (or `UNLIKELY()`) allows the compiler to optimize instruction scheduling for the success path.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 272,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Replace `counter = StorePositiveNumberAsOddNumber(1);` with `counter = 1;` to eliminate the redundant function call and improve readability.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 347,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Replace `counter = StorePositiveNumberAsOddNumber(0);` with `counter = 0;` to remove the unnecessary function call and enhance clarity.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 351,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Hoist the increment of `counter` out of the loop to avoid redundant operations on each iteration. This improves readability and reduces unnecessary computation.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 377,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Introduce a tiny RAII guard around the `iteratorTakeClosure` function to encapsulate cleanup of `iterated` and `closureData`. This keeps teardown co-located with acquisition, removes repeated `IteratorObject::iteratorClose` calls, and clarifies intent without altering semantics.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 501,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Factor out the error handling around `numLimit`'s conversion to integer into a local helper function `ensureIntegerLimit`. This reduces nesting, improves readability, and keeps error handling co-located with its use.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 531,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Refactor the `while` loop condition to use a guard clause for early exit when `value` is `done`. This reduces nesting and clarifies intent.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 634,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Move `iterated->m_done = true;` into the `if (!value)` branch to ensure it's only set when the loop exits due to being done, improving exception-safety.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 636,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "This error handling block `if (!O.isObject())` represents an exception path. Marking this branch with `[[unlikely]]` (or `UNLIKELY()`) allows the compiler to optimize instruction scheduling for the success path.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 622,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "The loop condition in `while (true)` is a clear hot path. Marking this branch with `[[likely]]` allows the compiler to optimize instruction scheduling for the common iteration case.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 633,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Introduce a tiny local helper `defineIteratorMethod` to encapsulate the repeated `directDefineOwnProperty` calls with identical descriptor flags. Keep the helper local and use it at each occurrence.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 721,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinIterator.cpp",
+          "body": "Factor out the common `NativeFunctionObject` creation into a local helper `createIteratorMethod` to avoid duplication in `directDefineOwnProperty`. Keep the helper local and use it at each occurrence.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 733,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/StaticStrings.h",
+          "body": "Hoist the `toArray` construction outside the loop to avoid repeated creation on each iteration. This reduces allocation and improves readability.",
+          "commit_id": "experiment/review-iterator-test-2",
+          "line": 468,
+          "side": "RIGHT"
+        }
+      ]
+    },
+    {
+      "experiment": 3,
+      "base_sha": "experiment/base-iterator-test-3",
+      "head_sha": "experiment/review-iterator-test-3",
+      "comments_count": 24,
+      "comments": [
+        {
+          "path": "src/builtins/BuiltinShadowRealm.cpp",
+          "body": "Wrap the `ErrorObject::throwBuiltinError` calls in tiny guard clauses to reduce nesting and clarify intent. Keep guards local to each call.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 75,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinShadowRealm.cpp",
+          "body": "Factor out the repeated `ObjectPropertyDescriptor` creation for `toStringTag` into a tiny helper near use, keeping it local and symmetrical with `#ifdef`.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 116,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/builtins/BuiltinShadowRealm.cpp",
+          "body": "This memory allocation check `if (!newTarget)` represents an exception path. Marking this branch with `[[unlikely]]` (or `UNLIKELY()`) allows the compiler to optimize instruction scheduling for the success path.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 45,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/Context.cpp",
+          "body": "Introduce a tiny RAII guard around the initialization of `m_defaultStructureForWrappedFunctionObject` to ensure it's cleaned up even if an early return occurs during construction. This improves exception-safety and keeps teardown co-located with acquisition.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 77,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/Context.h",
+          "body": "Hoist the `return` statement for `defaultStructureForWrappedFunctionObject()` to reduce duplication with other default structure functions. This improves readability and maintainability without altering semantics.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 217,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/Context.h",
+          "body": "Introduce a tiny RAII guard around the new `m_defaultStructureForWrappedFunctionObject` initialization to ensure it's cleaned up if any early returns occur in its constructor. Keep the guard local and avoid cross-file changes.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 367,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/GlobalObject.h",
+          "body": "Introduce a tiny guard clause around the `#ifdef` block to clarify conditional compilation and improve readability. This keeps the structure local and does not affect semantics.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 218,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/GlobalObject.h",
+          "body": "Add a new entry for `ShadowRealm` in the `F` macro list to maintain consistency with other global objects. This ensures that `ShadowRealm` is properly included when generating the built-in object list.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 347,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/PointerValue.h",
+          "body": "Introduce a tiny local RAII guard around the `WrappedFunctionObject` definition to encapsulate any cleanup needed upon early returns or exceptions. This keeps teardown co-located with acquisition and improves exception-safety without altering semantics.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 70,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/PointerValue.h",
+          "body": "Introduce a tiny local RAII guard around the `ShadowRealmObject` creation to ensure cleanup on early returns. Keep the guard definition and use strictly local to this scope.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 95,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/PointerValue.h",
+          "body": "Add a tiny guard clause to the new `isShadowRealmObject` method to clarify its purpose and simplify the function body. This keeps the code concise without altering semantics.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 282,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/PointerValue.h",
+          "body": "Add a local helper function `isWrappedFunctionObject` to the PointerValue class, returning false by default. This keeps the interface consistent with other virtual methods and maintains readability.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 417,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/PointerValue.h",
+          "body": "#if defined(ESCARGOT_ENABLE_SHADOWREALM) is a guard that introduces conditional compilation for ShadowRealmObject methods. This allows the method to be compiled only when ESCARGOT_ENABLE_SHADOWREALM is defined, improving compile-time performance by excluding unused code.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 761,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/PointerValue.h",
+          "body": "Remove the `ASSERT` check in `asWrappedFunctionObject()`. Since this method is only compiled when `ESCARGOT_ENABLE_SHADOWREALM` is defined, it's safe to assume that the object type is correct. This eliminates a redundant check and improves readability.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 888,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/ShadowRealmObject.h",
+          "body": "Wrap the `#if defined(ESCARGOT_ENABLE_SHADOWREALM)` guard around the `ShadowRealmObject` class definition to improve readability and consistency. This keeps related code co-located and reduces nesting.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 30,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/StaticStrings.h",
+          "body": "Introduce a tiny local helper `closeShadowRealm` near the use of `ShadowRealm` to encapsulate cleanup and improve readability. Keep the helper strictly local.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 102,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/StaticStrings.h",
+          "body": "Factor out a micro-helper `wrapFunction` around `WrappedFunction` creation to reduce duplication and clarify intent near its use.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 120,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/StaticStrings.h",
+          "body": "Remove the `F(evaluate)` line as it's not used in the current context and doesn't have a corresponding function definition elsewhere in the file. This reduces noise in the enum declaration without altering semantics.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 212,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/VMInstance.cpp",
+          "body": "Refactor the GC initialization of `VMInstance` by introducing a tiny helper function `initGCForWrappedFunctionObject` that sets the bit for `m_defaultStructureForWrappedFunctionObject`. This keeps related GC setup co-located and improves readability.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 171,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/VMInstance.cpp",
+          "body": "Hoist the `ObjectStructurePropertyDescriptor::createDataDescriptor(ObjectStructurePropertyDescriptor::ConfigurablePresent)` construction to a local variable before calling `addProperty` twice in this block. This avoids duplicating the descriptor creation and improves readability.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 478,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/VMInstance.h",
+          "body": "Add a comment to clarify the purpose of `m_defaultStructureForWrappedFunctionObject`, which is used for wrapped function objects. This improves readability and maintainability by providing context for this new addition.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 451,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/WrappedFunctionObject.cpp",
+          "body": "Wrap the `try` block around `Object::call` in a tiny RAII guard to ensure `GC_FREE` runs on all exits. This keeps allocation cleanup co-located with acquisition and removes duplicated `GC_FREE`s, improving exception-safety without altering semantics.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 62,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/WrappedFunctionObject.cpp",
+          "body": "Factor a local helper `performCall` to encapsulate the spec-step sequence of acquiring `m_wrappedTargetFunction`, calling it with wrapped arguments, and catching errors. This improves readability by separating common steps and keeps the helper strictly local.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 74,
+          "side": "RIGHT"
+        },
+        {
+          "path": "src/runtime/WrappedFunctionObject.h",
+          "body": "Refactor the `call` method to use a tiny helper function `ordinaryWrappedFunctionCall` for better separation of concerns. This keeps the spec-step structure explicit and improves readability without altering semantics.",
+          "commit_id": "experiment/review-iterator-test-3",
+          "line": 65,
+          "side": "RIGHT"
+        }
+      ]
+    }
+  ]
+}
