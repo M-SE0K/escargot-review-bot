@@ -8,6 +8,7 @@ import ollama
 
 from escargot_review_bot.config.config import (
     MODEL_NAME,
+    OLLAMA_KEEP_ALIVE,
     OLLAMA_MAX_RETRIES,
     OLLAMA_NUM_BATCH,
     OLLAMA_NUM_CTX,
@@ -108,22 +109,29 @@ def sanitize_llm_output(raw: str) -> str:
     return ""
 
 
-def chat_and_parse(system_prompt: str, user_prompt: str) -> List[Dict[str, Any]]:
+def chat_and_parse(
+    system_prompt: str,
+    user_prompt: str,
+    model: Optional[str] = None,
+    keep_alive: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Stream a chat completion and parse a JSON array from the output.
 
-    Stops early when a complete array is detected; otherwise falls back to
-    sanitization. Enforces a per-request timeout and retry policy.
+    model: Ollama model name. If None, uses config MODEL_NAME.
+    keep_alive: e.g. "0" (unload after request), "60m". If None, uses OLLAMA_KEEP_ALIVE.
     """
+    use_model = model if model is not None else MODEL_NAME
+    use_keep_alive = keep_alive if keep_alive is not None else OLLAMA_KEEP_ALIVE
+
     for attempt in range(OLLAMA_MAX_RETRIES):
         try:
-            logger.info(f"LLM request start model={MODEL_NAME}")
+            logger.info(f"LLM request start model={use_model} keep_alive={use_keep_alive}")
             logger.debug(f"LLM attempt {attempt + 1}/{OLLAMA_MAX_RETRIES} timeout={OLLAMA_TIMEOUT_SECONDS}s")
 
-            # Arm per-request timeout alarm
             signal.alarm(OLLAMA_TIMEOUT_SECONDS)
 
             stream = ollama.chat(
-                model=MODEL_NAME,
+                model=use_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -134,7 +142,7 @@ def chat_and_parse(system_prompt: str, user_prompt: str) -> List[Dict[str, Any]]
                     "num_batch": OLLAMA_NUM_BATCH,
                     "repeat_penalty": OLLAMA_REPEAT_PENALTY,
                 },
-                keep_alive="60m",
+                keep_alive=use_keep_alive,
                 stream=True,
             )
 
