@@ -32,13 +32,11 @@ REVIEW_INCLUDE_PATHS: List[str] = [
 
 
 # Ollama / LLM configuration
-MODEL_NAME = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3.0-coder:20b")
 
-# Setup B++ (The Golden Middle - 14B Class): Sequential Load -> Run -> Unload, CPU offload friendly
-# Pass별 모델. OLLAMA_KEEP_ALIVE=0 으로 Pass 종료 시 언로드하여 OOM 방지.
-OLLAMA_MODEL_DEFECT = os.getenv("OLLAMA_MODEL_DEFECT", "qwen2.5-coder:14b")
-OLLAMA_MODEL_REFACTOR = os.getenv("OLLAMA_MODEL_REFACTOR", "Mistral-Nemo:12b")
-OLLAMA_MODEL_COMPILER = os.getenv("OLLAMA_MODEL_COMPILER", "qwen2.5-coder:14b")
+OLLAMA_MODEL_DEFECT = os.getenv("OLLAMA_MODEL_DEFECT", "qwen3.0-coder:20b")
+OLLAMA_MODEL_REFACTOR = os.getenv("OLLAMA_MODEL_REFACTOR", "qwen3.0-coder:20b")
+OLLAMA_MODEL_COMPILER = os.getenv("OLLAMA_MODEL_COMPILER", "qwen3.0-coder:20b")
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "0")
 
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
