@@ -677,7 +677,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 snapshot = sorted(_active_tasks)
                 _timeline.append((_time.monotonic(), "START", task_label, concurrent_now))
             logger.debug(
-                f"[PARALLEL] ▶ START  {task_label:<30} | "
+                f"[PARA] ▶ START  {task_label:<30} | "
                 f"동시실행={concurrent_now}개 | "
                 f"활성: {snapshot}"
             )
@@ -703,7 +703,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 concurrent_after = len(_active_tasks)
                 _timeline.append((_time.monotonic(), "END  ", task_label, concurrent_after))
             logger.debug(
-                f"[PARALLEL] ■ END    {task_label:<30} | "
+                f"[PARA] ■ END    {task_label:<30} | "
                 f"경과={elapsed:.1f}s | "
                 f"남은활성={concurrent_after}개 | "
                 f"코멘트={len(comments)}개"
@@ -748,20 +748,20 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
 
         # ── 병렬 실행 요약 로그 ───────────────────────────────────────────────
         logger.info(
-            f"[PARALLEL] ✅ 완료 | 총 태스크={total_tasks} | "
+            f"[PARA] ✅ 완료 | 총 태스크={total_tasks} | "
             f"최대동시실행={_max_concurrent[0]}개 | "
             f"생성코멘트={len(all_github_comments)}개"
         )
         if _max_concurrent[0] >= 2:
-            logger.info("[PARALLEL] 🟢 실제 병렬 실행 확인됨 (max_concurrent ≥ 2)")
+            logger.info("[PARA] 🟢 실제 병렬 실행 확인됨 (max_concurrent ≥ 2)")
         else:
-            logger.warning("[PARALLEL] 🔴 병렬 실행 미확인 (모든 태스크가 직렬로 처리됨)")
+            logger.warning("[PARA] 🔴 병렬 실행 미확인 (모든 태스크가 직렬로 처리됨)")
 
-        logger.debug("[PARALLEL] === 타임라인 (시간순) ===")
+        logger.debug("[PARA] === 타임라인 (시간순) ===")
         t0 = _timeline[0][0] if _timeline else 0
         for ts, event, label, cnt in _timeline:
-            logger.debug(f"[PARALLEL]  +{ts - t0:6.2f}s  {event}  {label:<35}  동시={cnt}개")
-        logger.debug("[PARALLEL] ========================")
+            logger.debug(f"[PARA]  +{ts - t0:6.2f}s  {event}  {label:<35}  동시={cnt}개")
+        logger.debug("[PARA] ========================")
         # ─────────────────────────────────────────────────────────────────────
 
         logger.info(f"Generated {len(all_github_comments)} comments in total (parallel passes).")
