@@ -581,56 +581,102 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             skip_ids=skip_ids,
         )
 
-    # Phase 1: Defect 병렬
-    defect_results: List[Tuple[List[Dict[str, Any]], Set[int]]] = [
-        ([], set()) for _ in range(len(hunk_items))
-    ]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {executor.submit(run_defect, i): i for i in range(len(hunk_items))}
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                defect_results[idx] = future.result()
-            except Exception as e:
-                logger.exception(f"Defect pass failed for hunk {idx}: {e}")
+    # ── [HUNK] 계측 상태 ─────────────────────────────────────────────────
+    import threading as _threading
+    import time as _time
+    _hunk_lock = _threading.Lock()
+    _active_hunks: set = set()
+    _max_concurrent_hunks: list = [0]
+    _hunk_t0 = _time.monotonic()
+    # ─────────────────────────────────────────────────────────────────────
 
-    # Phase 2: Refactor 병렬
-    refactor_results: List[Tuple[List[Dict[str, Any]], Set[int]]] = [
-        ([], set()) for _ in range(len(hunk_items))
-    ]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {
-            executor.submit(run_refactor, i, defect_results[i][1]): i
-            for i in range(len(hunk_items))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                refactor_results[idx] = future.result()
-            except Exception as e:
-                logger.exception(f"Refactor pass failed for hunk {idx}: {e}")
+    def review_hunk(hunk_idx: int) -> List[Dict[str, Any]]:
+        """단일 hunk에 대해 Defect→Refactor→Compiler 순차 실행 (skip_ids 유지).
 
-    # Phase 3: Compiler 병렬
-    compiler_results: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {
-            executor.submit(run_compiler, i, defect_results[i][1] | refactor_results[i][1]): i
-            for i in range(len(hunk_items))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                comments, _ = future.result()
-                compiler_results[idx] = comments
-            except Exception as e:
-                logger.exception(f"Compiler pass failed for hunk {idx}: {e}")
+        여러 hunk 스레드가 동시에 이 함수를 실행한다 (hunk-parallel).
+        """
+        label = f"hunk={hunk_idx}"
+        t_hunk_start = _time.monotonic()
 
+        # START 계측
+        with _hunk_lock:
+            _active_hunks.add(label)
+            concurrent = len(_active_hunks)
+            if concurrent > _max_concurrent_hunks[0]:
+                _max_concurrent_hunks[0] = concurrent
+        logger.debug(
+            f"[HUNK] ▶ START {label} | 동시hunk={concurrent}개 | "
+            f"활성: {sorted(_active_hunks)}"
+        )
+
+        # Pass 1: Defect
+        t_pass = _time.monotonic()
+        d_comments, d_accepted = run_defect(hunk_idx)
+        logger.debug(
+            f"[HUNK] {label} defect done | "
+            f"elapsed={_time.monotonic()-t_pass:.1f}s | comments={len(d_comments)}"
+        )
+
+        # Pass 2: Refactor (skip defect-accepted lines)
+        t_pass = _time.monotonic()
+        r_comments, r_accepted = run_refactor(hunk_idx, d_accepted)
+        logger.debug(
+            f"[HUNK] {label} refactor done | "
+            f"elapsed={_time.monotonic()-t_pass:.1f}s | comments={len(r_comments)}"
+        )
+
+        # Pass 3: Compiler (skip defect+refactor accepted lines)
+        t_pass = _time.monotonic()
+        c_comments, _ = run_compiler(hunk_idx, d_accepted | r_accepted)
+        logger.debug(
+            f"[HUNK] {label} compiler done | "
+            f"elapsed={_time.monotonic()-t_pass:.1f}s | comments={len(c_comments)}"
+        )
+
+        hunk_total = d_comments + r_comments + c_comments
+        hunk_elapsed = _time.monotonic() - t_hunk_start
+
+        # END 계측
+        with _hunk_lock:
+            _active_hunks.discard(label)
+            remaining = len(_active_hunks)
+        logger.debug(
+            f"[HUNK] ■ END   {label} | "
+            f"total_elapsed={hunk_elapsed:.1f}s | "
+            f"comments={len(hunk_total)} | 남은hunk={remaining}개"
+        )
+        return hunk_total
+
+    # 모든 hunk를 workers개 동시에 실행
+    logger.info(
+        f"[HUNK] === START | hunks={len(hunk_items)} workers={workers} ==="
+    )
     all_github_comments: List[Dict[str, Any]] = []
-    for i in range(len(hunk_items)):
-        all_github_comments.extend(defect_results[i][0])
-        all_github_comments.extend(refactor_results[i][0])
-        all_github_comments.extend(compiler_results[i])
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_idx = {
+            executor.submit(review_hunk, i): i for i in range(len(hunk_items))
+        }
+        hunk_all_results: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                hunk_all_results[idx] = future.result()
+            except Exception as e:
+                logger.exception(f"Hunk {idx} review failed: {e}")
 
+    for hunk_comments in hunk_all_results:
+        all_github_comments.extend(hunk_comments)
+
+    total_elapsed = _time.monotonic() - _hunk_t0
+    logger.info(
+        f"[HUNK] ✅ 완료 | 총={len(all_github_comments)}개 코멘트 | "
+        f"총경과={total_elapsed:.1f}s | "
+        f"최대동시hunk={_max_concurrent_hunks[0]}개"
+    )
+    if workers > 1 and _max_concurrent_hunks[0] >= 2:
+        logger.info("[HUNK] 🟢 hunk 병렬 실행 확인됨")
+    elif workers > 1:
+        logger.warning("[HUNK] 🔴 hunk 병렬 실행 미확인 (직렬 처리됨)")
     logger.info(f"Generated {len(all_github_comments)} comments in total.")
     return all_github_comments
 

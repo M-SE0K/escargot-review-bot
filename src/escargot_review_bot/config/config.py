@@ -24,7 +24,7 @@ REVIEW_MAX_CONCURRENCY = int(os.getenv("REVIEW_MAX_CONCURRENCY", "1"))
 
 # Review bot settings
 DIFF_CONTEXT = int(os.getenv("DIFF_CONTEXT", "10"))
-REVIEW_PARALLEL_WORKERS = int(os.getenv("REVIEW_PARALLEL_WORKERS", "1"))
+REVIEW_PARALLEL_WORKERS = int(os.getenv("REVIEW_PARALLEL_WORKERS", "3"))
 REVIEW_INCLUDE_PATHS: List[str] = [
     p.strip() for p in os.getenv("REVIEW_INCLUDE_PATHS", "src/").split(",") if p.strip()
 ]
