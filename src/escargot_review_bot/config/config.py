@@ -24,8 +24,7 @@ REVIEW_MAX_CONCURRENCY = int(os.getenv("REVIEW_MAX_CONCURRENCY", "1"))
 
 # Review bot settings
 DIFF_CONTEXT = int(os.getenv("DIFF_CONTEXT", "10"))
-# 병렬 처리: Pass별로 여러 hunk를 동시에 처리할 워커 수 (1이면 순차). OLLAMA_KEEP_ALIVE=0이면 자동으로 1로 강제.
-REVIEW_PARALLEL_WORKERS = int(os.getenv("REVIEW_PARALLEL_WORKERS", "4"))
+REVIEW_PARALLEL_WORKERS = int(os.getenv("REVIEW_PARALLEL_WORKERS", "1"))
 REVIEW_INCLUDE_PATHS: List[str] = [
     p.strip() for p in os.getenv("REVIEW_INCLUDE_PATHS", "src/").split(",") if p.strip()
 ]
