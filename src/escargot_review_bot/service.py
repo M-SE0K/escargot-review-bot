@@ -584,17 +584,20 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         )
         workers = 1
 
-    single_model = (
-        OLLAMA_MODEL_DEFECT == OLLAMA_MODEL_REFACTOR == OLLAMA_MODEL_COMPILER
-    )
-    use_parallel_passes = REVIEW_PARALLEL_PASSES and single_model
+    use_parallel_passes = REVIEW_PARALLEL_PASSES
     if use_parallel_passes:
+        models_info = (
+            f"defect={OLLAMA_MODEL_DEFECT}, "
+            f"refactor={OLLAMA_MODEL_REFACTOR}, "
+            f"compiler={OLLAMA_MODEL_COMPILER}"
+        )
         logger.info(
-            f"Parallel passes enabled: single model ({OLLAMA_MODEL_DEFECT}), "
-            f"{len(hunk_items)} hunks × 3 passes = {3 * len(hunk_items)} tasks, max_workers={min(3 * workers, 3 * len(hunk_items))}."
+            f"Parallel passes enabled: [{models_info}], "
+            f"{len(hunk_items)} hunks × 3 passes = {3 * len(hunk_items)} tasks, "
+            f"max_workers={min(3 * workers, 3 * len(hunk_items))}."
         )
     else:
-        logger.info(f"Parallel review: {len(hunk_items)} hunks, {workers} workers per pass.")
+        logger.info(f"Sequential review: {len(hunk_items)} hunks, {workers} workers per pass.")
 
     def run_defect(i: int) -> Tuple[List[Dict[str, Any]], Set[int]]:
         fp, h, m, md = hunk_items[i]
@@ -641,8 +644,18 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         )
 
     if use_parallel_passes:
-        # 단일 모델: Defect/Refactor/Compiler 3개 패스를 동시에 실행 (skip_ids 없음 → 같은 라인 중복 가능)
+        # Defect/Refactor/Compiler 3개 패스를 동시에 실행 (skip_ids 없음 → 같은 라인 중복 가능)
         # 실행 후 (path, line) 단위로 병합하여 하나의 코멘트로 만듦
+
+        # ── 병렬 동시 실행 추적용 공유 상태 ──────────────────────────────────
+        import threading as _threading
+        import time as _time
+        _active_lock = _threading.Lock()
+        _active_tasks: set = set()          # 현재 실행 중인 (hunk_idx, pass_type) 집합
+        _max_concurrent: list = [0]         # 관찰된 최대 동시 실행 수 (list로 래핑해 클로저에서 변경 가능)
+        _timeline: list = []                # [(timestamp, event, task_label, concurrent_count)]
+        # ─────────────────────────────────────────────────────────────────────
+
         def run_pass(hunk_idx: int, pass_type: str) -> Tuple[str, int, List[Dict[str, Any]]]:
             fp, h, m, md = hunk_items[hunk_idx]
             if pass_type == "defect":
@@ -651,6 +664,25 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 model_name, system_prompt = OLLAMA_MODEL_REFACTOR, SYSTEM_PROMPT_REFACTOR
             else:
                 model_name, system_prompt = OLLAMA_MODEL_COMPILER, SYSTEM_PROMPT_COMPILER
+
+            task_label = f"{pass_type}/hunk={hunk_idx}"
+
+            # ── START 계측 ────────────────────────────────────────────────────
+            t_start = _time.monotonic()
+            with _active_lock:
+                _active_tasks.add(task_label)
+                concurrent_now = len(_active_tasks)
+                if concurrent_now > _max_concurrent[0]:
+                    _max_concurrent[0] = concurrent_now
+                snapshot = sorted(_active_tasks)
+                _timeline.append((_time.monotonic(), "START", task_label, concurrent_now))
+            logger.debug(
+                f"[PARALLEL] ▶ START  {task_label:<30} | "
+                f"동시실행={concurrent_now}개 | "
+                f"활성: {snapshot}"
+            )
+            # ─────────────────────────────────────────────────────────────────
+
             comments, _ = _run_review_pass(
                 model_type=pass_type,
                 model_name=model_name,
@@ -663,6 +695,21 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 head_blob_cache=head_blob_cache,
                 skip_ids=None,
             )
+
+            # ── END 계측 ──────────────────────────────────────────────────────
+            elapsed = _time.monotonic() - t_start
+            with _active_lock:
+                _active_tasks.discard(task_label)
+                concurrent_after = len(_active_tasks)
+                _timeline.append((_time.monotonic(), "END  ", task_label, concurrent_after))
+            logger.debug(
+                f"[PARALLEL] ■ END    {task_label:<30} | "
+                f"경과={elapsed:.1f}s | "
+                f"남은활성={concurrent_after}개 | "
+                f"코멘트={len(comments)}개"
+            )
+            # ─────────────────────────────────────────────────────────────────
+
             return (pass_type, hunk_idx, comments)
 
         defect_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
@@ -698,6 +745,25 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 compiler_results_pp[i],
             )
             all_github_comments.extend(merged)
+
+        # ── 병렬 실행 요약 로그 ───────────────────────────────────────────────
+        logger.info(
+            f"[PARALLEL] ✅ 완료 | 총 태스크={total_tasks} | "
+            f"최대동시실행={_max_concurrent[0]}개 | "
+            f"생성코멘트={len(all_github_comments)}개"
+        )
+        if _max_concurrent[0] >= 2:
+            logger.info("[PARALLEL] 🟢 실제 병렬 실행 확인됨 (max_concurrent ≥ 2)")
+        else:
+            logger.warning("[PARALLEL] 🔴 병렬 실행 미확인 (모든 태스크가 직렬로 처리됨)")
+
+        logger.debug("[PARALLEL] === 타임라인 (시간순) ===")
+        t0 = _timeline[0][0] if _timeline else 0
+        for ts, event, label, cnt in _timeline:
+            logger.debug(f"[PARALLEL]  +{ts - t0:6.2f}s  {event}  {label:<35}  동시={cnt}개")
+        logger.debug("[PARALLEL] ========================")
+        # ─────────────────────────────────────────────────────────────────────
+
         logger.info(f"Generated {len(all_github_comments)} comments in total (parallel passes).")
         return all_github_comments
 
