@@ -551,7 +551,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             head_blob_cache=head_blob_cache,
         )
 
-    def run_refactor(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
+    def run_refactor(i: int) -> Tuple[List[Dict[str, Any]], Set[int]]:
         fp, h, m, md = hunk_items[i]
         return _run_review_pass(
             model_type="refactor",
@@ -563,10 +563,10 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             mapping_dict=md,
             head_sha=request.head_sha,
             head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
+            skip_ids=None,  # no-skip: 패스 간 중복 제거 없음
         )
 
-    def run_compiler(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
+    def run_compiler(i: int) -> Tuple[List[Dict[str, Any]], Set[int]]:
         fp, h, m, md = hunk_items[i]
         return _run_review_pass(
             model_type="compiler",
@@ -578,7 +578,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             mapping_dict=md,
             head_sha=request.head_sha,
             head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
+            skip_ids=None,  # no-skip: 패스 간 중복 제거 없음
         )
 
     # ── [HUNK] 계측 상태 ─────────────────────────────────────────────────
@@ -591,7 +591,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
     # ─────────────────────────────────────────────────────────────────────
 
     def review_hunk(hunk_idx: int) -> List[Dict[str, Any]]:
-        """단일 hunk에 대해 Defect→Refactor→Compiler 순차 실행 (skip_ids 유지).
+        """단일 hunk에 대해 Defect→Refactor→Compiler 순차 실행 (skip_ids 없음 - 독립 리뷰).
 
         여러 hunk 스레드가 동시에 이 함수를 실행한다 (hunk-parallel).
         """
@@ -617,17 +617,17 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             f"elapsed={_time.monotonic()-t_pass:.1f}s | comments={len(d_comments)}"
         )
 
-        # Pass 2: Refactor (skip defect-accepted lines)
+        # Pass 2: Refactor (독립 실행, skip_ids 없음)
         t_pass = _time.monotonic()
-        r_comments, r_accepted = run_refactor(hunk_idx, d_accepted)
+        r_comments, _ = run_refactor(hunk_idx)
         logger.debug(
             f"[HUNK] {label} refactor done | "
             f"elapsed={_time.monotonic()-t_pass:.1f}s | comments={len(r_comments)}"
         )
 
-        # Pass 3: Compiler (skip defect+refactor accepted lines)
+        # Pass 3: Compiler (독립 실행, skip_ids 없음)
         t_pass = _time.monotonic()
-        c_comments, _ = run_compiler(hunk_idx, d_accepted | r_accepted)
+        c_comments, _ = run_compiler(hunk_idx)
         logger.debug(
             f"[HUNK] {label} compiler done | "
             f"elapsed={_time.monotonic()-t_pass:.1f}s | comments={len(c_comments)}"
