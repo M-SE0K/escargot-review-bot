@@ -552,7 +552,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             head_blob_cache=head_blob_cache,
         )
 
-    def run_refactor(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
+    def run_refactor(i: int) -> Tuple[List[Dict[str, Any]], Set[int]]:
         fp, h, m, md = hunk_items[i]
         return _run_review_pass(
             model_type="refactor",
@@ -564,10 +564,10 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             mapping_dict=md,
             head_sha=request.head_sha,
             head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
+            skip_ids=None,  # no-skip: 패스 간 중복 제거 없음
         )
 
-    def run_compiler(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
+    def run_compiler(i: int) -> Tuple[List[Dict[str, Any]], Set[int]]:
         fp, h, m, md = hunk_items[i]
         return _run_review_pass(
             model_type="compiler",
@@ -579,7 +579,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             mapping_dict=md,
             head_sha=request.head_sha,
             head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
+            skip_ids=None,  # no-skip: 패스 간 중복 제거 없음
         )
 
     # ── [SEQ] 전체 계측 시작 ─────────────────────────────────────────────
@@ -643,7 +643,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
     ]
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_idx = {
-            executor.submit(_seq_run, "refactor", run_refactor, i, defect_results[i][1]): i
+            executor.submit(_seq_run, "refactor", run_refactor, i): i
             for i in range(len(hunk_items))
         }
         for future in as_completed(future_to_idx):
@@ -663,10 +663,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
     compiler_results: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_idx = {
-            executor.submit(
-                _seq_run, "compiler", run_compiler,
-                i, defect_results[i][1] | refactor_results[i][1]
-            ): i
+            executor.submit(_seq_run, "compiler", run_compiler, i): i
             for i in range(len(hunk_items))
         }
         for future in as_completed(future_to_idx):
