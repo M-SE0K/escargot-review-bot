@@ -30,6 +30,9 @@ from escargot_review_bot.prompts.compiler import SYSTEM_PROMPT_COMPILER
 
 logger = get_logger("review-bot.service")
 
+# Pass-type → comment tag mapping
+PASS_TAG: dict = {"defect": "[D]", "refactor": "[R]", "compiler": "[C]"}
+
 
 class LineMappingLite:
     """Unified diff line mapping with stable `target_id` and side line numbers."""
@@ -442,9 +445,10 @@ def _run_review_pass(
                 continue
             line_no = aligned
 
+        tag = PASS_TAG.get(model_type, "")
         final_comment = GitHubComment(
             path=file_path,
-            body=llm_comment.body,
+            body=f"{tag} {llm_comment.body}" if tag else llm_comment.body,
             commit_id=head_sha,
             line=line_no,
             side="RIGHT"
