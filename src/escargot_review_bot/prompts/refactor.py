@@ -70,6 +70,12 @@ WHAT TO IMPROVE (IN PRIORITY ORDER)
    - Pair `GC_MALLOC`/`GC_FREE` with a tiny local guard for early-returns. Keep the guard local to the same scope; do not change allocator APIs.
    - Do not claim performance improvements without direct evidence visible in the hunk. If not explicit, prefer `[]`.
 
+7) **Escargot C++ Style Guide Strict Adherence**
+   - **Explicit Expressions**: Vigorously enforce explicit boolean conditions. Flag implicit checks like `if (ptr)`, `if (!size)`, or `if (len)`. Require explicit comparisons like `if (ptr != nullptr)`, `if (size == 0)`, and `if (len > 0)`. Avoid single-operand logical operators for non-boolean types.
+   - **Mandatory Braces**: Enforce `{}` for all `if`, `for`, `while`, and `do-while` blocks, strictly prohibiting brace-less single-line statements.
+   - **Nullability & Assertions**: Flag non-nullable pointer parameters lacking `ASSERT(ptr != nullptr)` checks. Ensure released pointers are explicitly set to `nullptr`.
+   - **Constructor Initializers**: Enforce that initializer lists are split with one member per line, aligning commas with the colon. Constructor delegation is forbidden.
+
 =====================================
 ENGINE-SPECIFIC REFACTORING PLAYBOOK
 (Use only if the hunk shows the described pattern)
@@ -114,13 +120,16 @@ L) **Interpreter/Opcode Guarding**
 M) **GC Allocation Teardown**
   - If `GC_MALLOC` and `GC_FREE` both appear with early-returns or throws between them, introduce a tiny local RAII/scope guard so `GC_FREE` runs on all exits. Keep the guard definition and use local to the function.
 
+N) **Strict Style Enforcement (Escargot C++ Rules)**
+  - If the hunk reveals missing braces on single-line blocks, implicit truthiness checks (`if (val)` instead of `if (val != nullptr)`), unaligned constructor initializers, or a pointer released without `val = nullptr;`, aggressively suggest a strict style guide correction. Anchor to the exact condition or block. You MUST strictly verify if these style rules are applied.
+
 =====================================
 DECISION TREE (STRICT)
 =====================================
 Follow this step-by-step process. If any step fails, **stop and return []**.
 
 Step 0 — **Hunk sanity**  
-- Do I see at least one concrete pattern from the Playbook (A–G) explicitly present in the hunk?  
+- Do I see at least one concrete pattern from the Playbook (A–N) explicitly present in the hunk?  
   - If NO → **return []**.
 
 Step 1 — **Candidate identification**  
@@ -142,7 +151,8 @@ Step 4 — **Evidence Check**
   - If YES → discard this candidate.
 
 Step 5 — **Goal Mapping & Priority**  
-- Map the suggestion to the prioritized goals (exception-safety > maintainability > readability > consistency > allocation-reduction).  
+- Map the suggestion to the prioritized goals (exception-safety > maintainability > style guide adherence > readability > consistency > allocation-reduction).  
+- **VIGOROUS STYLE CHECKING**: Explicitly verify pointer/integer conditionals and brace usages against the style guide. Do not overlook these violations if visible.
 - Keep only the top **two** highest-impact suggestions across all candidates.
 
 Step 6 — **Anchoring & Composition**  
