@@ -71,10 +71,16 @@ WHAT TO IMPROVE (IN PRIORITY ORDER)
    - Do not claim performance improvements without direct evidence visible in the hunk. If not explicit, prefer `[]`.
 
 7) **Escargot C++ Style Guide Strict Adherence**
-   - **Explicit Expressions**: Vigorously enforce explicit boolean conditions. Flag implicit checks like `if (ptr)`, `if (!size)`, or `if (len)`. Require explicit comparisons like `if (ptr != nullptr)`, `if (size == 0)`, and `if (len > 0)`. Avoid single-operand logical operators for non-boolean types.
-   - **Mandatory Braces**: Enforce `{}` for all `if`, `for`, `while`, and `do-while` blocks, strictly prohibiting brace-less single-line statements.
-   - **Nullability & Assertions**: Flag non-nullable pointer parameters lacking `ASSERT(ptr != nullptr)` checks. Ensure released pointers are explicitly set to `nullptr`.
-   - **Constructor Initializers**: Enforce that initializer lists are split with one member per line, aligning commas with the colon. Constructor delegation is forbidden.
+   - **Explicit Expressions & Nullability**: Vigorously enforce explicit boolean conditions. Flag implicit checks like `if (ptr)` or `if (len)`. Require `if (ptr != nullptr)` and `if (len > 0)`. Avoid single-operand logical operators `!` for non-boolean types. Non-nullable pointer arguments must have `ASSERT(ptr != nullptr)`. Released pointers must be explicitly assigned `nullptr`. Prefer references over pointers where possible. `Nullable<Object>` template should be used only for JS binding interfaces.
+   - **Mandatory Braces & Spacing**: Enforce `{}` for all `if`, `for`, `while`, and `do-while` blocks; strictly prohibit brace-less single-line statements. Require 1 space before `(` and between `)` and `{`. 4-space indent only; no tabs. Add 1 blank line between function implementations in `.cpp`. In `.h`, do not add blank lines inside explicitly grouped declarations, but use 1 blank line to separate groups.
+   - **Constructor Initializers**: Enforce initializer lists split with one member per line, aligning commas with the colon. Constructor delegation (calling other constructors) is strictly forbidden.
+   - **Function Declarations & Calls**: Use camelCase for function names. Declarations must use named parameters. Multi-line calls should break after the assignment operator or between arguments, aligning with the first argument. If the first argument does not fit on one line, indent the next line by 4 spaces. Do not add spaces before the first or after the last parameter. The opening brace `{` of a function definition must be on its own next line. Single-line functions are forbidden (except empty inline functions in headers).
+   - **Binary Operators**: When split, split AFTER the binary operator and align with the first operand. Over-parenthesize explicit precedence even when mathematically correct without them.
+   - **Class Layout**: Access modifiers (`public`, `protected`, `private`) must NOT be indented.
+   - **Headers & Includes**: `#define` guards must follow `__ProjectNameFileName__`. `#include` must be restricted to `.cpp` files whenever possible (except for inheritance or member instances); use forward declarations otherwise.
+   - **C++ Features**: `try-catch` statements are forbidden unless solely used to throw an exception. RTTI is forbidden. Prefer C++11 templates formatting (e.g., `A<B<int>>` over `A<B<int> >`). Use `NULLABLE` macro where applicable.
+   - **Memory Allocation**: Always check C-style allocators for failure. Use `ASSERT` or `if` before dereferencing non-GC allocated pointers.
+   - **Comments**: Prefer `//` over `/* */`. Write non-obvious behavior/pre-post conditions as comments at the function definition in `.cpp`. Simple `//` comments can be used in headers above declarations.
 
 =====================================
 ENGINE-SPECIFIC REFACTORING PLAYBOOK
