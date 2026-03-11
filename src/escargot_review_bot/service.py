@@ -14,6 +14,7 @@ from escargot_review_bot.config.config import (
     OLLAMA_MODEL_COMPILER,
     OLLAMA_MODEL_DEFECT,
     OLLAMA_MODEL_REFACTOR,
+    OLLAMA_MODEL_STYLE,
     REVIEW_INCLUDE_PATHS,
     REVIEW_PARALLEL_PASSES,
     REVIEW_PARALLEL_WORKERS,
@@ -27,12 +28,13 @@ from escargot_review_bot.domain.schemas import (
 from escargot_review_bot.prompts.defect import SYSTEM_PROMPT_DEFECT
 from escargot_review_bot.prompts.refactor import SYSTEM_PROMPT_REFACTOR
 from escargot_review_bot.prompts.compiler import SYSTEM_PROMPT_COMPILER
+from escargot_review_bot.prompts.style import SYSTEM_PROMPT_STYLE
 
 
 logger = get_logger("review-bot.service")
 
 # Pass-type → comment tag mapping
-PASS_TAG: dict = {"defect": "[D]", "refactor": "[R]", "compiler": "[C]"}
+PASS_TAG: dict = {"defect": "[D]", "refactor": "[R]", "compiler": "[C]", "style": "[S]"}
 
 
 class LineMappingLite:
@@ -467,13 +469,14 @@ def _run_review_pass(
 
 
 # 패스 우선순위: 병렬 실행 후 같은 라인에 여러 패스 코멘트가 있을 때 먼저 붙일 순서
-_PASS_ORDER = ("defect", "refactor", "compiler")
+_PASS_ORDER = ("defect", "refactor", "compiler", "style")
 
 
 def _merge_comments_by_line(
     defect_comments: List[Dict[str, Any]],
     refactor_comments: List[Dict[str, Any]],
     compiler_comments: List[Dict[str, Any]],
+    style_comments: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """(path, line) 단위로 묶어, 한 라인에 여러 패스 코멘트가 있으면 body를 합쳐 하나의 코멘트로 반환."""
     key_to_bodies: Dict[Tuple[str, int], Dict[str, List[str]]] = {}
@@ -481,6 +484,7 @@ def _merge_comments_by_line(
         ("defect", defect_comments),
         ("refactor", refactor_comments),
         ("compiler", compiler_comments),
+        ("style", style_comments),
     ]:
         for c in comments:
             path = c.get("path", "")
@@ -593,12 +597,13 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         models_info = (
             f"defect={OLLAMA_MODEL_DEFECT}, "
             f"refactor={OLLAMA_MODEL_REFACTOR}, "
-            f"compiler={OLLAMA_MODEL_COMPILER}"
+            f"compiler={OLLAMA_MODEL_COMPILER}, "
+            f"style={OLLAMA_MODEL_STYLE}"
         )
         logger.info(
             f"Parallel passes enabled: [{models_info}], "
-            f"{len(hunk_items)} hunks × 3 passes = {3 * len(hunk_items)} tasks, "
-            f"max_workers={min(3 * workers, 3 * len(hunk_items))}."
+            f"{len(hunk_items)} hunks × 4 passes = {4 * len(hunk_items)} tasks, "
+            f"max_workers={min(4 * workers, 4 * len(hunk_items))}."
         )
     else:
         logger.info(f"Sequential review: {len(hunk_items)} hunks, {workers} workers per pass.")
@@ -647,6 +652,22 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             skip_ids=skip_ids,
         )
 
+    def run_style(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
+        fp, h, m, md = hunk_items[i]
+        return _run_review_pass(
+            model_type="style",
+            model_name=OLLAMA_MODEL_STYLE,
+            system_prompt=SYSTEM_PROMPT_STYLE,
+            file_path=fp,
+            hunk=h,
+            mappings=m,
+            mapping_dict=md,
+            head_sha=request.head_sha,
+            head_blob_cache=head_blob_cache,
+            skip_ids=skip_ids,
+        )
+
+
     if use_parallel_passes:
         # Defect/Refactor/Compiler 3개 패스를 동시에 실행 (skip_ids 없음 → 같은 라인 중복 가능)
         # 실행 후 (path, line) 단위로 병합하여 하나의 코멘트로 만듦
@@ -666,6 +687,8 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 model_name, system_prompt = OLLAMA_MODEL_DEFECT, SYSTEM_PROMPT_DEFECT
             elif pass_type == "refactor":
                 model_name, system_prompt = OLLAMA_MODEL_REFACTOR, SYSTEM_PROMPT_REFACTOR
+            elif pass_type == "style":
+                model_name, system_prompt = OLLAMA_MODEL_STYLE, SYSTEM_PROMPT_STYLE
             else:
                 model_name, system_prompt = OLLAMA_MODEL_COMPILER, SYSTEM_PROMPT_COMPILER
 
@@ -719,14 +742,15 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         defect_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
         refactor_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
         compiler_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-        total_tasks = 3 * len(hunk_items)
-        max_workers_pp = min(3 * workers, total_tasks)
+        style_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
+        total_tasks = 4 * len(hunk_items)
+        max_workers_pp = min(4 * workers, total_tasks)
 
         with ThreadPoolExecutor(max_workers=max_workers_pp) as executor:
             future_to_meta = {
                 executor.submit(run_pass, i, pt): (i, pt)
                 for i in range(len(hunk_items))
-                for pt in ("defect", "refactor", "compiler")
+                for pt in ("defect", "refactor", "compiler", "style")
             }
             for future in as_completed(future_to_meta):
                 hunk_idx, pass_type = future_to_meta[future]
@@ -736,6 +760,8 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                         defect_results_pp[idx] = comments
                     elif pt == "refactor":
                         refactor_results_pp[idx] = comments
+                    elif pt == "style":
+                        style_results_pp[idx] = comments
                     else:
                         compiler_results_pp[idx] = comments
                 except Exception as e:
@@ -747,6 +773,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 defect_results_pp[i],
                 refactor_results_pp[i],
                 compiler_results_pp[i],
+                style_results_pp[i],
             )
             all_github_comments.extend(merged)
 
@@ -813,11 +840,30 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             except Exception as e:
                 logger.exception(f"Compiler pass failed for hunk {idx}: {e}")
 
+    style_results: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_idx = {
+            executor.submit(run_style, i, defect_results[i][1] | refactor_results[i][1] | set() ): i
+            # Not using compiler_results[i][1] since compiler doesn't return accepted IDs in this simplified logic, 
+            # wait, run_compiler DOES return accepted IDs in _run_review_pass? 
+            # Ah, the logic for compiler_results was previously just [[] for _ in range(...)], meaning (comments, _) was ignored.
+            # I will just skip IDs from defect & refactor to keep it simple and match original flow.
+            for i in range(len(hunk_items))
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                comments, _ = future.result()
+                style_results[idx] = comments
+            except Exception as e:
+                logger.exception(f"Style pass failed for hunk {idx}: {e}")
+
     all_github_comments = []
     for i in range(len(hunk_items)):
         all_github_comments.extend(defect_results[i][0])
         all_github_comments.extend(refactor_results[i][0])
         all_github_comments.extend(compiler_results[i])
+        all_github_comments.extend(style_results[i])
 
     logger.info(f"Generated {len(all_github_comments)} comments in total.")
     return all_github_comments
