@@ -1,6 +1,6 @@
 import json
 import re
-import signal
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +8,7 @@ import ollama
 
 from escargot_review_bot.config.config import (
     MODEL_NAME,
+    OLLAMA_KEEP_ALIVE,
     OLLAMA_MAX_RETRIES,
     OLLAMA_NUM_BATCH,
     OLLAMA_NUM_CTX,
@@ -27,15 +28,6 @@ JSON_ARRAY_RE = re.compile(r"\[[\s\S]*?\]")
 
 class OllamaTimeoutError(Exception):
     """Raised when an Ollama API call exceeds the configured timeout."""
-
-
-def _timeout_handler(signum, frame):
-    """Signal handler that raises `OllamaTimeoutError` when alarm fires."""
-    raise OllamaTimeoutError(f"Ollama API call timed out after {OLLAMA_TIMEOUT_SECONDS} seconds.")
-
-
-# Install alarm handler for per-request timeout
-signal.signal(signal.SIGALRM, _timeout_handler)
 
 
 def _find_complete_json_array_span(s: str) -> Optional[tuple]:
@@ -108,89 +100,141 @@ def sanitize_llm_output(raw: str) -> str:
     return ""
 
 
-def chat_and_parse(system_prompt: str, user_prompt: str) -> List[Dict[str, Any]]:
+def _do_chat_stream(
+    use_model: str,
+    use_keep_alive: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> List[Dict[str, Any]]:
+    """Performs the actual Ollama stream call and JSON parsing (timeout logic is separated).
+
+    This is called in a separate thread by chat_and_parse, a thread-safe timeout wrapper.
+    """
+    stream = ollama.chat(
+        model=use_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        options={
+            "temperature": OLLAMA_TEMPERATURE,
+            "num_ctx": OLLAMA_NUM_CTX,
+            "num_batch": OLLAMA_NUM_BATCH,
+            "repeat_penalty": OLLAMA_REPEAT_PENALTY,
+        },
+        keep_alive=use_keep_alive,
+        stream=True,
+    )
+
+    buf_parts: List[str] = []
+    parsed: Optional[List[Dict[str, Any]]] = None
+    for chunk in stream:
+        # Normalize chunk content across possible dict/object shapes
+        content = getattr(getattr(chunk, "message", None), "content", None)
+        if content is None and isinstance(chunk, dict):
+            msg = chunk.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        # Accumulate partial content and check for a complete JSON array
+        buf_parts.append(content)
+        text = "".join(buf_parts)
+        span = _find_complete_json_array_span(text)
+        if span is not None:
+            start, end = span
+            array_text = text[start:end + 1]
+            try:
+                raw_comments = json.loads(array_text)
+                if isinstance(raw_comments, list):
+                    parsed = [c for c in raw_comments if isinstance(c, dict)]
+                    if parsed and len(parsed) > 0:
+                        logger.debug("LLM stream-early-stop: json array complete")
+                        logger.debug(f"LLM items={len(parsed)}")
+                    else:
+                        logger.debug("LLM stream-early-stop: empty JSON array []")
+                    break
+            except Exception:
+                pass
+
+    if parsed is None:
+        if not buf_parts:
+            logger.debug("LLM empty response (no content chunks)")
+            return []
+        # Fallback: sanitize accumulated text to extract a valid array
+        text = "".join(buf_parts)
+        cleaned = sanitize_llm_output(text)
+        if not cleaned:
+            logger.debug("LLM sanitize produced empty string; returning []")
+            return []
+        raw_comments = json.loads(cleaned)
+        if not isinstance(raw_comments, list):
+            logger.debug(f"LLM parsed non-list JSON: type={type(raw_comments)}")
+            return []
+        parsed = [c for c in raw_comments if isinstance(c, dict)]
+        if not parsed:
+            logger.debug("LLM parsed JSON array but contained 0 objects ([])")
+
+    return parsed or []
+
+
+def chat_and_parse(
+    system_prompt: str,
+    user_prompt: str,
+    model: Optional[str] = None,
+    keep_alive: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Stream a chat completion and parse a JSON array from the output.
 
-    Stops early when a complete array is detected; otherwise falls back to
-    sanitization. Enforces a per-request timeout and retry policy.
+    model: Ollama model name. If None, uses config MODEL_NAME.
+    keep_alive: e.g. "0" (unload after request), "60m". If None, uses OLLAMA_KEEP_ALIVE.
+
+    Thread-safe timeout: uses threading.Timer instead of signal.SIGALRM so that
+    multiple passes can run concurrently in a ThreadPoolExecutor without stomping
+    on each other's alarm signal.
     """
+    use_model = model if model is not None else MODEL_NAME
+    use_keep_alive = keep_alive if keep_alive is not None else OLLAMA_KEEP_ALIVE
+
     for attempt in range(OLLAMA_MAX_RETRIES):
+        result_holder: List[Any] = [None]   # [0] = parsed list or exception
+        done_event = threading.Event()
+
+        def _worker():
+            try:
+                result_holder[0] = _do_chat_stream(
+                    use_model, use_keep_alive, system_prompt, user_prompt
+                )
+            except Exception as exc:
+                result_holder[0] = exc
+            finally:
+                done_event.set()
+
         try:
-            logger.info(f"LLM request start model={MODEL_NAME}")
-            logger.debug(f"LLM attempt {attempt + 1}/{OLLAMA_MAX_RETRIES} timeout={OLLAMA_TIMEOUT_SECONDS}s")
-
-            # Arm per-request timeout alarm
-            signal.alarm(OLLAMA_TIMEOUT_SECONDS)
-
-            stream = ollama.chat(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                options={
-                    "temperature": OLLAMA_TEMPERATURE,
-                    "num_ctx": OLLAMA_NUM_CTX,
-                    "num_batch": OLLAMA_NUM_BATCH,
-                    "repeat_penalty": OLLAMA_REPEAT_PENALTY,
-                },
-                keep_alive="60m",
-                stream=True,
+            logger.info(f"LLM request start model={use_model} keep_alive={use_keep_alive}")
+            logger.debug(
+                f"LLM attempt {attempt + 1}/{OLLAMA_MAX_RETRIES} "
+                f"timeout={OLLAMA_TIMEOUT_SECONDS}s"
             )
 
-            buf_parts: List[str] = []
-            parsed: Optional[List[Dict[str, Any]]] = None
-            for chunk in stream:
-                # Normalize chunk content across possible dict/object shapes
-                content = getattr(getattr(chunk, "message", None), "content", None)
-                if content is None and isinstance(chunk, dict):
-                    msg = chunk.get("message")
-                    if isinstance(msg, dict):
-                        content = msg.get("content")
-                if not isinstance(content, str) or not content:
-                    continue
-                # Accumulate partial content and check for a complete JSON array
-                buf_parts.append(content)
-                text = "".join(buf_parts)
-                span = _find_complete_json_array_span(text)
-                if span is not None:
-                    start, end = span
-                    array_text = text[start:end + 1]
-                    try:
-                        raw_comments = json.loads(array_text)
-                        if isinstance(raw_comments, list):
-                            parsed = [c for c in raw_comments if isinstance(c, dict)]
-                            if parsed and len(parsed) > 0:
-                                logger.debug("LLM stream-early-stop: json array complete")
-                                logger.debug(f"LLM items={len(parsed)}")
-                            else:
-                                logger.debug("LLM stream-early-stop: empty JSON array []")
-                            # Stop streaming once a valid JSON array is parsed
-                            break
-                    except Exception:
-                        pass
+            worker_thread = threading.Thread(target=_worker, daemon=True)
+            worker_thread.start()
 
-            # Disarm alarm now that streaming finished
-            signal.alarm(0)
+            # Wait up to timeout; if the event fires early we continue immediately
+            finished = done_event.wait(timeout=OLLAMA_TIMEOUT_SECONDS)
 
-            if parsed is None:
-                if not buf_parts:
-                    logger.debug("LLM empty response (no content chunks)")
-                    return []
-                # Fallback: sanitize accumulated text to extract a valid array
-                text = "".join(buf_parts)
-                cleaned = sanitize_llm_output(text)
-                if not cleaned:
-                    logger.debug("LLM sanitize produced empty string; returning []")
-                    return []
-                raw_comments = json.loads(cleaned)
-                if not isinstance(raw_comments, list):
-                    logger.debug(f"LLM parsed non-list JSON: type={type(raw_comments)}")
-                    return []
-                parsed = [c for c in raw_comments if isinstance(c, dict)]
-                if not parsed:
-                    logger.debug("LLM parsed JSON array but contained 0 objects ([])")
+            if not finished:
+                # Thread is still running — treat as timeout
+                raise OllamaTimeoutError(
+                    f"Ollama API call timed out after {OLLAMA_TIMEOUT_SECONDS}s "
+                    f"(model={use_model})"
+                )
 
+            outcome = result_holder[0]
+            if isinstance(outcome, Exception):
+                raise outcome
+
+            parsed = outcome or []
             logger.info(f"LLM parsed comments: count={len(parsed)}")
             try:
                 logger.debug(f"LLM sample parsed: {parsed[:2]}")
@@ -210,8 +254,6 @@ def chat_and_parse(system_prompt: str, user_prompt: str) -> List[Dict[str, Any]]
             logger.error(f"LLM unexpected error: {e}")
             return []
         finally:
-            # Ensure alarm is always cleared and apply optional pacing delay
-            signal.alarm(0)
             if INTER_REQUEST_DELAY_SECONDS > 0:
                 try:
                     time.sleep(INTER_REQUEST_DELAY_SECONDS)

@@ -24,19 +24,28 @@ REVIEW_MAX_CONCURRENCY = int(os.getenv("REVIEW_MAX_CONCURRENCY", "1"))
 
 # Review bot settings
 DIFF_CONTEXT = int(os.getenv("DIFF_CONTEXT", "10"))
+REVIEW_PARALLEL_WORKERS = int(os.getenv("REVIEW_PARALLEL_WORKERS", "4"))
+REVIEW_PARALLEL_PASSES = os.getenv("REVIEW_PARALLEL_PASSES", "false").lower() in ("1", "true", "yes")
 REVIEW_INCLUDE_PATHS: List[str] = [
     p.strip() for p in os.getenv("REVIEW_INCLUDE_PATHS", "src/").split(",") if p.strip()
 ]
 
 
 # Ollama / LLM configuration
-MODEL_NAME = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")
+OLLAMA_MODEL_DEFECT = os.getenv("OLLAMA_MODEL_DEFECT", "qwen3-coder:30b")
+OLLAMA_MODEL_REFACTOR = os.getenv("OLLAMA_MODEL_REFACTOR", "qwen3-coder:30b")
+OLLAMA_MODEL_COMPILER = os.getenv("OLLAMA_MODEL_COMPILER", "qwen3-coder:30b")
+OLLAMA_MODEL_STYLE = os.getenv("OLLAMA_MODEL_STYLE", "qwen3-coder:30b")
+OLLAMA_MODEL_JUDGE = os.getenv("OLLAMA_MODEL_JUDGE", "qwen3-coder:30b")
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "0")
+
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 OLLAMA_NUM_BATCH = int(os.getenv("OLLAMA_NUM_BATCH", "256"))
 OLLAMA_REPEAT_PENALTY = float(os.getenv("OLLAMA_REPEAT_PENALTY", "1.1"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.8"))
 ALIGN_SEARCH_WINDOW = int(os.getenv("ALIGN_SEARCH_WINDOW", "25"))
-OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "600"))
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "3600"))  # 3-hour window: 3600s per request
 OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "2"))
 INTER_REQUEST_DELAY_SECONDS = float(os.getenv("INTER_REQUEST_DELAY_SECONDS", "5"))
