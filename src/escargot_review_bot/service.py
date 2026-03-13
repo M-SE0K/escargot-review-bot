@@ -470,9 +470,7 @@ def _run_review_pass(
     return out_comments, accepted
 
 
-# 패스 우선순위: 병렬 실행 후 같은 라인에 여러 패스 코멘트가 있을 때 먼저 붙일 순서
 _PASS_ORDER = ("defect", "refactor", "compiler", "style")
-
 
 def _merge_comments_by_line(
     hunk_item: Tuple[str, Hunk, List[LineMappingLite], Dict[int, Any]],
@@ -481,7 +479,7 @@ def _merge_comments_by_line(
     compiler_comments: List[Dict[str, Any]],
     style_comments: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """(path, line) 단위로 묶어, 한 라인에 여러 패스 코멘트가 있으면 Judge 모델을 통해 하나의 코멘트로 합침."""
+    """Groups by (path, line). If there are multiple pass comments on the same line, merges them into a single comment using the Judge model."""
     fp, h, m, mapping_dict = hunk_item
     key_to_bodies: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for label, comments in [
@@ -509,14 +507,14 @@ def _merge_comments_by_line(
         if not parts:
             continue
             
-        # Target code content 추출
-        target_code = "(해당 라인 매핑 실패)"
+        # Extract target code content
+        target_code = "(Failed to map the line)"
         for mapping in m:
             if mapping.target_line_no == info["line"]:
                 target_code = line_without_prefix(mapping.content).strip()
                 break
 
-        # 패스 순서대로 정렬 후 프롬프트 생성
+        # Sort by pass order and generate prompt
         order_idx = {p: i for i, p in enumerate(_PASS_ORDER)}
         parts_sorted = sorted(parts, key=lambda x: order_idx.get(x[0], 99))
         
@@ -730,8 +728,8 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 _timeline.append((_time.monotonic(), "START", task_label, concurrent_now))
             logger.debug(
                 f"[PARA] ▶ START  {task_label:<30} | "
-                f"동시실행={concurrent_now}개 | "
-                f"활성: {snapshot}"
+                f"concurrent={concurrent_now} | "
+                f"active: {snapshot}"
             )
 
             comments, _ = _run_review_pass(
@@ -754,9 +752,9 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 _timeline.append((_time.monotonic(), "END  ", task_label, concurrent_after))
             logger.debug(
                 f"[PARA] ■ END    {task_label:<30} | "
-                f"경과={elapsed:.1f}s | "
-                f"남은활성={concurrent_after}개 | "
-                f"코멘트={len(comments)}개"
+                f"elapsed={elapsed:.1f}s | "
+                f"active_remaining={concurrent_after} | "
+                f"comments={len(comments)}"
             )
 
             return (pass_type, hunk_idx, comments)
@@ -801,19 +799,19 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             all_github_comments.extend(merged)
 
         logger.info(
-            f"[PARA] ✅ 완료 | 총 태스크={total_tasks} | "
-            f"최대동시실행={_max_concurrent[0]}개 | "
-            f"생성코멘트={len(all_github_comments)}개"
+            f"[PARA] ✅ Done | total tasks={total_tasks} | "
+            f"max_concurrent={_max_concurrent[0]} | "
+            f"generated_comments={len(all_github_comments)}"
         )
         if _max_concurrent[0] >= 2:
-            logger.info("[PARA] 🟢 실제 병렬 실행 확인됨 (max_concurrent ≥ 2)")
+            logger.info("[PARA] 🟢 Actual parallel execution confirmed (max_concurrent >= 2)")
         else:
-            logger.warning("[PARA] 🔴 병렬 실행 미확인 (모든 태스크가 직렬로 처리됨)")
+            logger.warning("[PARA] 🔴 Parallel execution unconfirmed (all tasks processed serially)")
 
-        logger.debug("[PARA] === 타임라인 (시간순) ===")
+        logger.debug("[PARA] === Timeline (Chronological) ===")
         t0 = _timeline[0][0] if _timeline else 0
         for ts, event, label, cnt in _timeline:
-            logger.debug(f"[PARA]  +{ts - t0:6.2f}s  {event}  {label:<35}  동시={cnt}개")
+            logger.debug(f"[PARA]  +{ts - t0:6.2f}s  {event}  {label:<35}  concurrent={cnt}")
         logger.debug("[PARA] ========================")
         # ─────────────────────────────────────────────────────────────────────
 

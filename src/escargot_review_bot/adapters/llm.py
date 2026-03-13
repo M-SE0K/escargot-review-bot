@@ -106,9 +106,9 @@ def _do_chat_stream(
     system_prompt: str,
     user_prompt: str,
 ) -> List[Dict[str, Any]]:
-    """실제 Ollama 스트림 호출 및 JSON 파싱 (타임아웃 로직 분리).
+    """Performs the actual Ollama stream call and JSON parsing (timeout logic is separated).
 
-    Thread-safe timeout wrapper인 chat_and_parse에서 별도 스레드로 호출된다.
+    This is called in a separate thread by chat_and_parse, a thread-safe timeout wrapper.
     """
     stream = ollama.chat(
         model=use_model,
