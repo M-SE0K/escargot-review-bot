@@ -13,6 +13,7 @@ from escargot_review_bot.config.config import (
     OLLAMA_KEEP_ALIVE,
     OLLAMA_MODEL_COMPILER,
     OLLAMA_MODEL_DEFECT,
+    OLLAMA_MODEL_JUDGE,
     OLLAMA_MODEL_REFACTOR,
     OLLAMA_MODEL_STYLE,
     REVIEW_INCLUDE_PATHS,
@@ -29,6 +30,7 @@ from escargot_review_bot.prompts.defect import SYSTEM_PROMPT_DEFECT
 from escargot_review_bot.prompts.refactor import SYSTEM_PROMPT_REFACTOR
 from escargot_review_bot.prompts.compiler import SYSTEM_PROMPT_COMPILER
 from escargot_review_bot.prompts.style import SYSTEM_PROMPT_STYLE
+from escargot_review_bot.prompts.judge import SYSTEM_PROMPT_JUDGE
 
 
 logger = get_logger("review-bot.service")
@@ -473,13 +475,15 @@ _PASS_ORDER = ("defect", "refactor", "compiler", "style")
 
 
 def _merge_comments_by_line(
+    hunk_item: Tuple[str, Hunk, List[LineMappingLite], Dict[int, Any]],
     defect_comments: List[Dict[str, Any]],
     refactor_comments: List[Dict[str, Any]],
     compiler_comments: List[Dict[str, Any]],
     style_comments: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """(path, line) 단위로 묶어, 한 라인에 여러 패스 코멘트가 있으면 body를 합쳐 하나의 코멘트로 반환."""
-    key_to_bodies: Dict[Tuple[str, int], Dict[str, List[str]]] = {}
+    """(path, line) 단위로 묶어, 한 라인에 여러 패스 코멘트가 있으면 Judge 모델을 통해 하나의 코멘트로 합침."""
+    fp, h, m, mapping_dict = hunk_item
+    key_to_bodies: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for label, comments in [
         ("defect", defect_comments),
         ("refactor", refactor_comments),
@@ -497,19 +501,50 @@ def _merge_comments_by_line(
             body = (c.get("body") or "").strip()
             if body:
                 key_to_bodies[key]["parts"].append((label, body))
+                
     merged: List[Dict[str, Any]] = []
     for key in sorted(key_to_bodies.keys()):
         info = key_to_bodies[key]
         parts = info["parts"]
         if not parts:
             continue
-        # 패스 순서대로 정렬 후 하나의 body로 합침
+            
+        # Target code content 추출
+        target_code = "(해당 라인 매핑 실패)"
+        for mapping in m:
+            if mapping.target_line_no == info["line"]:
+                target_code = line_without_prefix(mapping.content).strip()
+                break
+
+        # 패스 순서대로 정렬 후 프롬프트 생성
         order_idx = {p: i for i, p in enumerate(_PASS_ORDER)}
         parts_sorted = sorted(parts, key=lambda x: order_idx.get(x[0], 99))
-        body_pieces = [f"**[{p[0].title()}]**\n{b}" for p, b in parts_sorted]
+        
+        proposals_text = ""
+        for p_label, b_text in parts_sorted:
+            proposals_text += f"[{p_label.upper()}]\n{b_text}\n\n"
+            
+        judge_prompt = f"## Target File: `{info['path']}`\n## Target Line: `{target_code}`\n\n## Proposals:\n{proposals_text.strip()}"
+        
+        logger.debug(f"Judge pass starting for {info['path']}:{info['line']} (proposals: {len(parts)})")
+        
+        raw = chat_and_parse(
+            SYSTEM_PROMPT_JUDGE,
+            judge_prompt,
+            model=OLLAMA_MODEL_JUDGE
+        )
+        
+        if not raw or len(raw) == 0:
+            logger.debug(f"Judge pass rejected proposals for {info['line']}.")
+            continue
+            
+        judged_comment = raw[0].get("body", "").strip()
+        if not judged_comment:
+            continue
+
         merged.append({
             "path": info["path"],
-            "body": "\n\n".join(body_pieces),
+            "body": judged_comment,
             "commit_id": info["commit_id"],
             "line": info["line"],
             "side": info["side"],
@@ -551,7 +586,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         logger.exception(f"Diff parse failed: {e}")
         return []
 
-    # HEAD blob cache: 병렬에서 읽기만 하도록 미리 채움
     head_blob_cache: Dict[str, List[str]] = {}
     for patched_file in patch_set:
         file_path = patched_file.path
@@ -566,7 +600,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 logger.debug(f"Could not load blob {key}: {e}")
                 head_blob_cache[key] = []
 
-    # 수집: (file_path, hunk, mappings, mapping_dict) 리스트
     hunk_items: List[Tuple[str, Hunk, List[LineMappingLite], Dict[int, Any]]] = []
     for patched_file in patch_set:
         file_path = patched_file.path
@@ -583,8 +616,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         logger.info("No hunks to review.")
         return []
 
-    # OLLAMA_KEEP_ALIVE=0 이면 요청 종료 시 모델이 언로드됨. 같은 모델로 동시 요청 시
-    # 먼저 끝난 요청이 모델을 내리면 나머지 요청이 실패/빈 응답을 받으므로, 이 경우 1 worker로 순차 처리.
     workers = max(1, REVIEW_PARALLEL_WORKERS)
     if OLLAMA_KEEP_ALIVE == "0" and workers > 1:
         logger.info(
@@ -669,17 +700,12 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
 
 
     if use_parallel_passes:
-        # Defect/Refactor/Compiler 3개 패스를 동시에 실행 (skip_ids 없음 → 같은 라인 중복 가능)
-        # 실행 후 (path, line) 단위로 병합하여 하나의 코멘트로 만듦
-
-        # ── 병렬 동시 실행 추적용 공유 상태 ──────────────────────────────────
         import threading as _threading
         import time as _time
         _active_lock = _threading.Lock()
-        _active_tasks: set = set()          # 현재 실행 중인 (hunk_idx, pass_type) 집합
-        _max_concurrent: list = [0]         # 관찰된 최대 동시 실행 수 (list로 래핑해 클로저에서 변경 가능)
-        _timeline: list = []                # [(timestamp, event, task_label, concurrent_count)]
-        # ─────────────────────────────────────────────────────────────────────
+        _active_tasks: set = set()          
+        _max_concurrent: list = [0]        
+        _timeline: list = []                
 
         def run_pass(hunk_idx: int, pass_type: str) -> Tuple[str, int, List[Dict[str, Any]]]:
             fp, h, m, md = hunk_items[hunk_idx]
@@ -694,7 +720,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
 
             task_label = f"{pass_type}/hunk={hunk_idx}"
 
-            # ── START 계측 ────────────────────────────────────────────────────
             t_start = _time.monotonic()
             with _active_lock:
                 _active_tasks.add(task_label)
@@ -708,7 +733,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 f"동시실행={concurrent_now}개 | "
                 f"활성: {snapshot}"
             )
-            # ─────────────────────────────────────────────────────────────────
 
             comments, _ = _run_review_pass(
                 model_type=pass_type,
@@ -723,7 +747,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 skip_ids=None,
             )
 
-            # ── END 계측 ──────────────────────────────────────────────────────
             elapsed = _time.monotonic() - t_start
             with _active_lock:
                 _active_tasks.discard(task_label)
@@ -735,7 +758,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 f"남은활성={concurrent_after}개 | "
                 f"코멘트={len(comments)}개"
             )
-            # ─────────────────────────────────────────────────────────────────
 
             return (pass_type, hunk_idx, comments)
 
@@ -770,6 +792,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         all_github_comments = []
         for i in range(len(hunk_items)):
             merged = _merge_comments_by_line(
+                hunk_items[i],
                 defect_results_pp[i],
                 refactor_results_pp[i],
                 compiler_results_pp[i],
@@ -777,7 +800,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             )
             all_github_comments.extend(merged)
 
-        # ── 병렬 실행 요약 로그 ───────────────────────────────────────────────
         logger.info(
             f"[PARA] ✅ 완료 | 총 태스크={total_tasks} | "
             f"최대동시실행={_max_concurrent[0]}개 | "
@@ -798,7 +820,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         logger.info(f"Generated {len(all_github_comments)} comments in total (parallel passes).")
         return all_github_comments
 
-    # 기존: Phase 1 Defect → Phase 2 Refactor → Phase 3 Compiler 순차, 패스 내 hunk만 병렬
     defect_results: List[Tuple[List[Dict[str, Any]], Set[int]]] = [
         ([], set()) for _ in range(len(hunk_items))
     ]
