@@ -538,24 +538,27 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
     """
     logger.info(f"Start review PR=#{request.pull_request_number} {request.base_sha}..{request.head_sha}")
     
-    with ls.trace(
-        name=f"PR Review #{request.pull_request_number}",
-        run_type="chain",
-        inputs={
-            "pr_number": request.pull_request_number,
-            "base_sha": request.base_sha[:8],
-            "head_sha": request.head_sha[:8],
-        },
-        tags=["pr-review"],
-        metadata={
-            "pr_number": request.pull_request_number,
-            "base_sha": request.base_sha,
-            "head_sha": request.head_sha,
-        },
-    ) as parent_run:
-        result = _execute_review(request)
-        parent_run.end(outputs={"comment_count": len(result)})
-        return result
+    pr_project_name = f"escargot-review-bot/PR-{request.pull_request_number}"
+    
+    with ls.tracing_context(project_name=pr_project_name):
+        with ls.trace(
+            name=f"PR Review #{request.pull_request_number}",
+            run_type="chain",
+            inputs={
+                "pr_number": request.pull_request_number,
+                "base_sha": request.base_sha[:8],
+                "head_sha": request.head_sha[:8],
+            },
+            tags=["pr-review"],
+            metadata={
+                "pr_number": request.pull_request_number,
+                "base_sha": request.base_sha,
+                "head_sha": request.head_sha,
+            },
+        ) as parent_run:
+            result = _execute_review(request)
+            parent_run.end(outputs={"comment_count": len(result)})
+            return result
 
 
 def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
