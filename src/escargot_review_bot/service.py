@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import langsmith as ls
 from fastapi import HTTPException
 from unidiff import PatchSet, Hunk
 
@@ -346,6 +347,7 @@ def _run_review_pass(
     head_sha: str,
     head_blob_cache: Dict[str, List[str]],
     skip_ids: Set[int] | None = None,
+    hunk_index: int = 0,
 ) -> Tuple[List[Dict[str, Any]], Set[int]]:
     """Run one pass (defect/refactor/compiler/style) using LangChain LCEL chain.
 
@@ -357,7 +359,19 @@ def _run_review_pass(
     chain = build_review_chain(model_type, model=model_name)
     
     try:
-        comments = chain.invoke(chain_input)
+        comments = chain.invoke(
+            chain_input,
+            config={
+                "tags": [f"pass:{model_type}", f"hunk:{hunk_index}"],
+                "metadata": {
+                    "pass_type": model_type,
+                    "model": model_name,
+                    "file_path": file_path,
+                    "hunk_index": hunk_index,
+                },
+                "run_name": f"{model_type}::{file_path.split('/')[-1]}::hunk{hunk_index}",
+            }
+        )
     except Exception as e:
         logger.error(f"{model_type} pass: chain invoke failed: {e}")
         return [], set()
@@ -486,11 +500,23 @@ def _merge_comments_by_line(
         logger.debug(f"Judge pass starting for {info['path']}:{info['line']} (proposals: {len(parts)})")
         
         try:
-            judge_comments = judge_chain.invoke({
-                "file_path": info["path"],
-                "target_code": target_code,
-                "proposals_text": proposals_text.strip(),
-            })
+            judge_comments = judge_chain.invoke(
+                {
+                    "file_path": info["path"],
+                    "target_code": target_code,
+                    "proposals_text": proposals_text.strip(),
+                },
+                config={
+                    "tags": ["pass:judge", f"line:{info['line']}"],
+                    "metadata": {
+                        "pass_type": "judge",
+                        "file_path": info["path"],
+                        "line": info["line"],
+                        "proposal_count": len(parts),
+                    },
+                    "run_name": f"judge::{info['path'].split('/')[-1]}::L{info['line']}",
+                }
+            )
         except Exception as e:
             logger.error(f"Judge chain invoke failed: {e}")
             continue
@@ -519,9 +545,33 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
     Fetches upstream, builds unified diff, runs defect, refactor, and compiler
     optimization passes per hunk, applies confidence/alignment checks, and returns
     GitHub comments.
+    
+    Wraps the entire review process in a LangSmith parent trace for organized monitoring.
     """
     logger.info(f"Start review PR=#{request.pull_request_number} {request.base_sha}..{request.head_sha}")
+    
+    with ls.trace(
+        name=f"PR Review #{request.pull_request_number}",
+        run_type="chain",
+        inputs={
+            "pr_number": request.pull_request_number,
+            "base_sha": request.base_sha[:8],
+            "head_sha": request.head_sha[:8],
+        },
+        tags=["pr-review"],
+        metadata={
+            "pr_number": request.pull_request_number,
+            "base_sha": request.base_sha,
+            "head_sha": request.head_sha,
+        },
+    ) as parent_run:
+        result = _execute_review(request)
+        parent_run.end(outputs={"comment_count": len(result)})
+        return result
 
+
+def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
+    """Internal implementation of the review logic."""
     # Fetch upstream refs and ensure base/head SHAs are available locally
     logger.info("Fetching latest data from upstream...")
     fetch_upstream_with_fallback(request.pull_request_number, request.base_sha, request.head_sha)
@@ -611,6 +661,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             mapping_dict=md,
             head_sha=request.head_sha,
             head_blob_cache=head_blob_cache,
+            hunk_index=i,
         )
 
     def run_refactor(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
@@ -625,6 +676,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             head_sha=request.head_sha,
             head_blob_cache=head_blob_cache,
             skip_ids=skip_ids,
+            hunk_index=i,
         )
 
     def run_compiler(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
@@ -639,6 +691,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             head_sha=request.head_sha,
             head_blob_cache=head_blob_cache,
             skip_ids=skip_ids,
+            hunk_index=i,
         )
 
     def run_style(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
@@ -653,6 +706,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             head_sha=request.head_sha,
             head_blob_cache=head_blob_cache,
             skip_ids=skip_ids,
+            hunk_index=i,
         )
 
 
@@ -700,6 +754,7 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
                 head_sha=request.head_sha,
                 head_blob_cache=head_blob_cache,
                 skip_ids=None,
+                hunk_index=hunk_idx,
             )
 
             elapsed = _time.monotonic() - t_start
