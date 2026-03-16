@@ -5,6 +5,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 import ollama
+from langchain_ollama import ChatOllama
+from langchain_core.runnables import RunnableSerializable
 
 from escargot_review_bot.config.config import (
     MODEL_NAME,
@@ -21,6 +23,63 @@ from escargot_review_bot.config.logging import get_logger
 
 
 logger = get_logger("review-bot.llm")
+
+
+def get_chat_ollama(
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    num_ctx: Optional[int] = None,
+    num_batch: Optional[int] = None,
+    repeat_penalty: Optional[float] = None,
+    keep_alive: Optional[str] = None,
+) -> ChatOllama:
+    """Create a ChatOllama instance with project defaults.
+    
+    Args:
+        model: Ollama model name. Defaults to MODEL_NAME from config.
+        temperature: Sampling temperature. Defaults to OLLAMA_TEMPERATURE.
+        num_ctx: Context window size. Defaults to OLLAMA_NUM_CTX.
+        num_batch: Batch size. Defaults to OLLAMA_NUM_BATCH.
+        repeat_penalty: Repeat penalty. Defaults to OLLAMA_REPEAT_PENALTY.
+        keep_alive: Keep alive duration. Defaults to OLLAMA_KEEP_ALIVE.
+        
+    Returns:
+        Configured ChatOllama instance.
+    """
+    return ChatOllama(
+        model=model or MODEL_NAME,
+        temperature=temperature if temperature is not None else OLLAMA_TEMPERATURE,
+        num_ctx=num_ctx if num_ctx is not None else OLLAMA_NUM_CTX,
+        num_predict=-1,
+        repeat_penalty=repeat_penalty if repeat_penalty is not None else OLLAMA_REPEAT_PENALTY,
+        keep_alive=keep_alive if keep_alive is not None else OLLAMA_KEEP_ALIVE,
+    )
+
+
+_llm_cache: Dict[str, ChatOllama] = {}
+
+
+def get_cached_llm(model: str) -> ChatOllama:
+    """Get or create a cached ChatOllama instance for the given model.
+    
+    Caches instances to avoid repeated initialization overhead.
+    
+    Args:
+        model: Ollama model name.
+        
+    Returns:
+        Cached or newly created ChatOllama instance.
+    """
+    if model not in _llm_cache:
+        logger.debug(f"Creating new ChatOllama instance for model={model}")
+        _llm_cache[model] = get_chat_ollama(model=model)
+    return _llm_cache[model]
+
+
+def clear_llm_cache() -> None:
+    """Clear the LLM instance cache."""
+    _llm_cache.clear()
+    logger.debug("LLM cache cleared")
 
 
 JSON_ARRAY_RE = re.compile(r"\[[\s\S]*?\]")
@@ -261,3 +320,55 @@ def chat_and_parse(
                     pass
 
     return []
+
+
+def build_review_chain(
+    pass_type: str,
+    model: Optional[str] = None,
+) -> RunnableSerializable:
+    """Build a LangChain LCEL chain for a review pass.
+    
+    Constructs: prompt | llm | parser
+    
+    Args:
+        pass_type: One of "defect", "refactor", "compiler", "style"
+        model: Ollama model name. Defaults to MODEL_NAME.
+        
+    Returns:
+        LCEL chain that takes {"file_path", "hunk_text", "commentable_catalog"}
+        and returns List[LLMReviewComment].
+    """
+    from escargot_review_bot.prompts import get_prompt
+    from escargot_review_bot.adapters.parsers import review_comment_list_parser
+    
+    prompt = get_prompt(pass_type)
+    llm = get_cached_llm(model or MODEL_NAME)
+    
+    chain = prompt | llm | review_comment_list_parser
+    logger.debug(f"Built review chain for pass_type={pass_type}, model={model or MODEL_NAME}")
+    return chain
+
+
+def build_judge_chain(
+    model: Optional[str] = None,
+) -> RunnableSerializable:
+    """Build a LangChain LCEL chain for the judge pass.
+    
+    Constructs: prompt | llm | parser
+    
+    Args:
+        model: Ollama model name. Defaults to MODEL_NAME.
+        
+    Returns:
+        LCEL chain that takes {"file_path", "target_code", "proposals_text"}
+        and returns List[JudgeComment].
+    """
+    from escargot_review_bot.prompts import get_prompt
+    from escargot_review_bot.adapters.parsers import judge_comment_list_parser
+    
+    prompt = get_prompt("judge")
+    llm = get_cached_llm(model or MODEL_NAME)
+    
+    chain = prompt | llm | judge_comment_list_parser
+    logger.debug(f"Built judge chain with model={model or MODEL_NAME}")
+    return chain

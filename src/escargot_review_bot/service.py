@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from unidiff import PatchSet, Hunk
 
 from escargot_review_bot.adapters.git import run_git_command
-from escargot_review_bot.adapters.llm import chat_and_parse
+from escargot_review_bot.adapters.llm import build_review_chain, build_judge_chain
 from escargot_review_bot.config.config import (
     ALIGN_SEARCH_WINDOW,
     CONFIDENCE_THRESHOLD,
@@ -26,11 +26,6 @@ from escargot_review_bot.domain.schemas import (
     LLMReviewComment,
     ReviewRequest,
 )
-from escargot_review_bot.prompts.defect import SYSTEM_PROMPT_DEFECT
-from escargot_review_bot.prompts.refactor import SYSTEM_PROMPT_REFACTOR
-from escargot_review_bot.prompts.compiler import SYSTEM_PROMPT_COMPILER
-from escargot_review_bot.prompts.style import SYSTEM_PROMPT_STYLE
-from escargot_review_bot.prompts.judge import SYSTEM_PROMPT_JUDGE
 
 
 logger = get_logger("review-bot.service")
@@ -276,13 +271,12 @@ def try_nearby_align(
     return None
 
 
-def build_hunk_based_prompt(path: str, hunk: Hunk, mappings: List[LineMappingLite]) -> str:
-    """Compose a hunk review prompt including diff and Commentable Catalog.
+def prepare_chain_input(path: str, hunk: Hunk, mappings: List[LineMappingLite]) -> Dict[str, str]:
+    """Prepare input dictionary for LangChain review chains.
 
-    Catalog lists only added lines with `<ID ...>` anchors to constrain output.
-    The prompt enforces hunk-locality and a strict JSON-only response.
+    Returns a dict with keys: file_path, hunk_text, commentable_catalog
+    that can be passed directly to build_review_chain().invoke()
     """
-    # Render raw diff hunk and assemble Commentable Catalog (added lines only)
     hunk_text = str(hunk)
     commentable = [
         m for m in mappings
@@ -297,34 +291,11 @@ def build_hunk_based_prompt(path: str, hunk: Hunk, mappings: List[LineMappingLit
     else:
         commentable_str = "(no added lines)"
 
-    # Compose the strict prompt instructing JSON-only output anchored by IDs
-    return f"""
-You are a world-class C++ and JavaScript engine reviewer for the Escargot project. Your review must be strict and technically precise.
-
-## Target File: `{path}`
-## Review Task
-Your task is to review the code changes within the `DIFF HUNK` section only. Use the diff purely; do NOT comment on any line outside of the 'Commentable Catalog'.
-
-### Hard Rules
-- Choose "target_id" ONLY from **Commentable Catalog (ADDED lines only)**.
-- If no qualifying added line has an issue, return [].
-- Do NOT mention or infer any line numbers (e.g., "line 47", "at 115"). Anchor only by exact tokens from the chosen line.
-
----
-### 1. DIFF HUNK
-```diff
-{hunk_text}
-```
-
----
-### 2. Commentable Catalog (ADDED lines only; eligible IDs)
-```
-{commentable_str}
-```
-
-### Output (JSON array only)
-Each object: "target_id", "body", "confidence". If none, return [].
-""".strip()
+    return {
+        "file_path": path,
+        "hunk_text": hunk_text,
+        "commentable_catalog": commentable_str,
+    }
 
 
 def fetch_upstream_with_fallback(pull_request_number: int, base_sha: str, head_sha: str) -> None:
@@ -368,7 +339,6 @@ def fetch_upstream_with_fallback(pull_request_number: int, base_sha: str, head_s
 def _run_review_pass(
     model_type: str,
     model_name: str,
-    system_prompt: str,
     file_path: str,
     hunk: Hunk,
     mappings: List[LineMappingLite],
@@ -377,42 +347,35 @@ def _run_review_pass(
     head_blob_cache: Dict[str, List[str]],
     skip_ids: Set[int] | None = None,
 ) -> Tuple[List[Dict[str, Any]], Set[int]]:
-    """Run one pass (defect/refactor/compiler): invoke LLM and post-filter results.
+    """Run one pass (defect/refactor/compiler/style) using LangChain LCEL chain.
 
-    model_name: Ollama model for this pass (Setup B++: sequential Load -> Run -> Unload).
+    Uses build_review_chain() to construct: prompt | llm | parser
     """
-    prompt = build_hunk_based_prompt(file_path, hunk, mappings)
+    chain_input = prepare_chain_input(file_path, hunk, mappings)
+    logger.debug(f"{model_type.title()} pass: model={model_name}")
+
+    chain = build_review_chain(model_type, model=model_name)
+    
     try:
-        logger.debug(f"{model_type.title()} pass: model={model_name} prompt length={len(prompt)}")
-    except Exception:
-        logger.debug(f"{model_type.title()} pass: model={model_name}")
+        comments = chain.invoke(chain_input)
+    except Exception as e:
+        logger.error(f"{model_type} pass: chain invoke failed: {e}")
+        return [], set()
+    
+    logger.info(f"{model_type} pass: LLM returned {len(comments)} raw comment(s)")
 
-    raw = chat_and_parse(system_prompt, prompt, model=model_name)
-    logger.info(f"{model_type} pass: LLM returned {len(raw)} raw comment(s)")
-
-    # Filter pipeline: schema -> dedup -> confidence -> mapping -> alignment
     out_comments: List[Dict[str, Any]] = []
     accepted: Set[int] = set()
 
-    for c in raw:
-        try:
-            llm_comment = LLMReviewComment(**c)
-        except Exception as e:
-            keys = list(c.keys()) if isinstance(c, dict) else "n/a"
-            logger.debug(f"Skip({model_type}): schema invalid -> {e} | keys={keys} | raw={c}")
-            continue
-
-        # Skip IDs already accepted in a previous pass (dedup across passes)
+    for llm_comment in comments:
         if skip_ids and llm_comment.target_id in skip_ids:
             logger.debug(f"Skip({model_type}): already accepted id={llm_comment.target_id}")
             continue
 
-        # Same-pass dedup: one comment per line per pass
         if llm_comment.target_id in accepted:
             logger.debug(f"Skip({model_type}): duplicate target_id={llm_comment.target_id} in this pass")
             continue
 
-        # Enforce minimum confidence threshold (LLM produces the value)
         if llm_comment.confidence < CONFIDENCE_THRESHOLD:
             logger.debug(f"Skip({model_type}): low confidence {llm_comment.confidence:.2f} < {CONFIDENCE_THRESHOLD}")
             continue
@@ -425,9 +388,7 @@ def _run_review_pass(
         line_no = m.target_line_no
         head_ok = assert_head_alignment(head_sha, file_path, m, head_blob_cache)
         if head_ok is False:
-            # Try to locate the same line content nearby if exact slot changed
             logger.debug(f"Align mismatch at ~{line_no}, trying nearby align...")
-            # Build small neighbor context around the target line within the hunk
             try:
                 center_index = next(i for i, mm in enumerate(mappings) if mm.target_id == m.target_id)
             except StopIteration:
@@ -462,10 +423,10 @@ def _run_review_pass(
         accepted.add(llm_comment.target_id)
         logger.debug(f"Accept({model_type}): id={llm_comment.target_id} -> line={line_no}")
 
-    if len(raw) > 0 and len(out_comments) == 0:
+    if len(comments) > 0 and len(out_comments) == 0:
         logger.warning(
-            f"{model_type} pass: all {len(raw)} comment(s) dropped by filters "
-            "(schema/confidence/target_id/HEAD alignment). Check LOG_LEVEL=DEBUG for Skip reasons."
+            f"{model_type} pass: all {len(comments)} comment(s) dropped by filters "
+            "(confidence/target_id/HEAD alignment). Check LOG_LEVEL=DEBUG for Skip reasons."
         )
     return out_comments, accepted
 
@@ -479,7 +440,7 @@ def _merge_comments_by_line(
     compiler_comments: List[Dict[str, Any]],
     style_comments: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Groups by (path, line). If there are multiple pass comments on the same line, merges them into a single comment using the Judge model."""
+    """Groups by (path, line). Uses Judge chain to merge multiple pass comments."""
     fp, h, m, mapping_dict = hunk_item
     key_to_bodies: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for label, comments in [
@@ -501,20 +462,20 @@ def _merge_comments_by_line(
                 key_to_bodies[key]["parts"].append((label, body))
                 
     merged: List[Dict[str, Any]] = []
+    judge_chain = build_judge_chain(model=OLLAMA_MODEL_JUDGE)
+    
     for key in sorted(key_to_bodies.keys()):
         info = key_to_bodies[key]
         parts = info["parts"]
         if not parts:
             continue
             
-        # Extract target code content
         target_code = "(Failed to map the line)"
         for mapping in m:
             if mapping.target_line_no == info["line"]:
                 target_code = line_without_prefix(mapping.content).strip()
                 break
 
-        # Sort by pass order and generate prompt
         order_idx = {p: i for i, p in enumerate(_PASS_ORDER)}
         parts_sorted = sorted(parts, key=lambda x: order_idx.get(x[0], 99))
         
@@ -522,21 +483,23 @@ def _merge_comments_by_line(
         for p_label, b_text in parts_sorted:
             proposals_text += f"[{p_label.upper()}]\n{b_text}\n\n"
             
-        judge_prompt = f"## Target File: `{info['path']}`\n## Target Line: `{target_code}`\n\n## Proposals:\n{proposals_text.strip()}"
-        
         logger.debug(f"Judge pass starting for {info['path']}:{info['line']} (proposals: {len(parts)})")
         
-        raw = chat_and_parse(
-            SYSTEM_PROMPT_JUDGE,
-            judge_prompt,
-            model=OLLAMA_MODEL_JUDGE
-        )
+        try:
+            judge_comments = judge_chain.invoke({
+                "file_path": info["path"],
+                "target_code": target_code,
+                "proposals_text": proposals_text.strip(),
+            })
+        except Exception as e:
+            logger.error(f"Judge chain invoke failed: {e}")
+            continue
         
-        if not raw or len(raw) == 0:
+        if not judge_comments:
             logger.debug(f"Judge pass rejected proposals for {info['line']}.")
             continue
             
-        judged_comment = raw[0].get("body", "").strip()
+        judged_comment = judge_comments[0].body.strip()
         if not judged_comment:
             continue
 
@@ -642,7 +605,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         return _run_review_pass(
             model_type="defect",
             model_name=OLLAMA_MODEL_DEFECT,
-            system_prompt=SYSTEM_PROMPT_DEFECT,
             file_path=fp,
             hunk=h,
             mappings=m,
@@ -656,7 +618,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         return _run_review_pass(
             model_type="refactor",
             model_name=OLLAMA_MODEL_REFACTOR,
-            system_prompt=SYSTEM_PROMPT_REFACTOR,
             file_path=fp,
             hunk=h,
             mappings=m,
@@ -671,7 +632,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         return _run_review_pass(
             model_type="compiler",
             model_name=OLLAMA_MODEL_COMPILER,
-            system_prompt=SYSTEM_PROMPT_COMPILER,
             file_path=fp,
             hunk=h,
             mappings=m,
@@ -686,7 +646,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         return _run_review_pass(
             model_type="style",
             model_name=OLLAMA_MODEL_STYLE,
-            system_prompt=SYSTEM_PROMPT_STYLE,
             file_path=fp,
             hunk=h,
             mappings=m,
@@ -707,14 +666,13 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
 
         def run_pass(hunk_idx: int, pass_type: str) -> Tuple[str, int, List[Dict[str, Any]]]:
             fp, h, m, md = hunk_items[hunk_idx]
-            if pass_type == "defect":
-                model_name, system_prompt = OLLAMA_MODEL_DEFECT, SYSTEM_PROMPT_DEFECT
-            elif pass_type == "refactor":
-                model_name, system_prompt = OLLAMA_MODEL_REFACTOR, SYSTEM_PROMPT_REFACTOR
-            elif pass_type == "style":
-                model_name, system_prompt = OLLAMA_MODEL_STYLE, SYSTEM_PROMPT_STYLE
-            else:
-                model_name, system_prompt = OLLAMA_MODEL_COMPILER, SYSTEM_PROMPT_COMPILER
+            model_map = {
+                "defect": OLLAMA_MODEL_DEFECT,
+                "refactor": OLLAMA_MODEL_REFACTOR,
+                "style": OLLAMA_MODEL_STYLE,
+                "compiler": OLLAMA_MODEL_COMPILER,
+            }
+            model_name = model_map.get(pass_type, OLLAMA_MODEL_DEFECT)
 
             task_label = f"{pass_type}/hunk={hunk_idx}"
 
@@ -735,7 +693,6 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
             comments, _ = _run_review_pass(
                 model_type=pass_type,
                 model_name=model_name,
-                system_prompt=system_prompt,
                 file_path=fp,
                 hunk=h,
                 mappings=m,
