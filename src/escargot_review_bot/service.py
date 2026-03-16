@@ -347,11 +347,11 @@ def _run_review_pass(
     head_sha: str,
     head_blob_cache: Dict[str, List[str]],
     skip_ids: Set[int] | None = None,
-    hunk_index: int = 0,
 ) -> Tuple[List[Dict[str, Any]], Set[int]]:
     """Run one pass (defect/refactor/compiler/style) using LangChain LCEL chain.
 
     Uses build_review_chain() to construct: prompt | llm | parser
+    Tracing is handled by the parent hunk-level trace.
     """
     chain_input = prepare_chain_input(file_path, hunk, mappings)
     logger.debug(f"{model_type.title()} pass: model={model_name}")
@@ -359,19 +359,13 @@ def _run_review_pass(
     chain = build_review_chain(model_type, model=model_name)
     
     try:
-        comments = chain.invoke(
-            chain_input,
-            config={
-                "tags": [f"pass:{model_type}", f"hunk:{hunk_index}"],
-                "metadata": {
-                    "pass_type": model_type,
-                    "model": model_name,
-                    "file_path": file_path,
-                    "hunk_index": hunk_index,
-                },
-                "run_name": f"{model_type}::{file_path.split('/')[-1]}::hunk{hunk_index}",
-            }
-        )
+        with ls.trace(
+            name=f"{model_type} pass",
+            run_type="chain",
+            metadata={"pass_type": model_type, "model": model_name},
+            tags=[f"pass:{model_type}"],
+        ):
+            comments = chain.invoke(chain_input)
     except Exception as e:
         logger.error(f"{model_type} pass: chain invoke failed: {e}")
         return [], set()
@@ -500,23 +494,17 @@ def _merge_comments_by_line(
         logger.debug(f"Judge pass starting for {info['path']}:{info['line']} (proposals: {len(parts)})")
         
         try:
-            judge_comments = judge_chain.invoke(
-                {
+            with ls.trace(
+                name=f"judge L{info['line']}",
+                run_type="chain",
+                metadata={"pass_type": "judge", "line": info["line"], "proposal_count": len(parts)},
+                tags=["pass:judge"],
+            ):
+                judge_comments = judge_chain.invoke({
                     "file_path": info["path"],
                     "target_code": target_code,
                     "proposals_text": proposals_text.strip(),
-                },
-                config={
-                    "tags": ["pass:judge", f"line:{info['line']}"],
-                    "metadata": {
-                        "pass_type": "judge",
-                        "file_path": info["path"],
-                        "line": info["line"],
-                        "proposal_count": len(parts),
-                    },
-                    "run_name": f"judge::{info['path'].split('/')[-1]}::L{info['line']}",
-                }
-            )
+                })
         except Exception as e:
             logger.error(f"Judge chain invoke failed: {e}")
             continue
@@ -650,252 +638,114 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
     else:
         logger.info(f"Sequential review: {len(hunk_items)} hunks, {workers} workers per pass.")
 
-    def run_defect(i: int) -> Tuple[List[Dict[str, Any]], Set[int]]:
+    def get_hunk_line_range(hunk: Hunk) -> str:
+        """Get line range string for hunk (e.g., 'L42-L58')."""
+        start = hunk.target_start
+        end = hunk.target_start + hunk.target_length - 1
+        if start == end:
+            return f"L{start}"
+        return f"L{start}-L{end}"
+
+    def run_single_hunk_with_trace(i: int) -> List[Dict[str, Any]]:
+        """Run all passes for a single hunk within a unified trace."""
         fp, h, m, md = hunk_items[i]
-        return _run_review_pass(
-            model_type="defect",
-            model_name=OLLAMA_MODEL_DEFECT,
-            file_path=fp,
-            hunk=h,
-            mappings=m,
-            mapping_dict=md,
-            head_sha=request.head_sha,
-            head_blob_cache=head_blob_cache,
-            hunk_index=i,
-        )
-
-    def run_refactor(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
-        fp, h, m, md = hunk_items[i]
-        return _run_review_pass(
-            model_type="refactor",
-            model_name=OLLAMA_MODEL_REFACTOR,
-            file_path=fp,
-            hunk=h,
-            mappings=m,
-            mapping_dict=md,
-            head_sha=request.head_sha,
-            head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
-            hunk_index=i,
-        )
-
-    def run_compiler(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
-        fp, h, m, md = hunk_items[i]
-        return _run_review_pass(
-            model_type="compiler",
-            model_name=OLLAMA_MODEL_COMPILER,
-            file_path=fp,
-            hunk=h,
-            mappings=m,
-            mapping_dict=md,
-            head_sha=request.head_sha,
-            head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
-            hunk_index=i,
-        )
-
-    def run_style(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
-        fp, h, m, md = hunk_items[i]
-        return _run_review_pass(
-            model_type="style",
-            model_name=OLLAMA_MODEL_STYLE,
-            file_path=fp,
-            hunk=h,
-            mappings=m,
-            mapping_dict=md,
-            head_sha=request.head_sha,
-            head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
-            hunk_index=i,
-        )
-
-
-    if use_parallel_passes:
-        import threading as _threading
-        import time as _time
-        _active_lock = _threading.Lock()
-        _active_tasks: set = set()          
-        _max_concurrent: list = [0]        
-        _timeline: list = []                
-
-        def run_pass(hunk_idx: int, pass_type: str) -> Tuple[str, int, List[Dict[str, Any]]]:
-            fp, h, m, md = hunk_items[hunk_idx]
-            model_map = {
-                "defect": OLLAMA_MODEL_DEFECT,
-                "refactor": OLLAMA_MODEL_REFACTOR,
-                "style": OLLAMA_MODEL_STYLE,
-                "compiler": OLLAMA_MODEL_COMPILER,
-            }
-            model_name = model_map.get(pass_type, OLLAMA_MODEL_DEFECT)
-
-            task_label = f"{pass_type}/hunk={hunk_idx}"
-
-            t_start = _time.monotonic()
-            with _active_lock:
-                _active_tasks.add(task_label)
-                concurrent_now = len(_active_tasks)
-                if concurrent_now > _max_concurrent[0]:
-                    _max_concurrent[0] = concurrent_now
-                snapshot = sorted(_active_tasks)
-                _timeline.append((_time.monotonic(), "START", task_label, concurrent_now))
-            logger.debug(
-                f"[PARA] ▶ START  {task_label:<30} | "
-                f"concurrent={concurrent_now} | "
-                f"active: {snapshot}"
+        file_name = fp.split('/')[-1]
+        line_range = get_hunk_line_range(h)
+        trace_name = f"{file_name}_{line_range}"
+        
+        with ls.trace(
+            name=trace_name,
+            run_type="chain",
+            metadata={
+                "file_path": fp,
+                "hunk_index": i,
+                "target_start": h.target_start,
+                "target_length": h.target_length,
+            },
+            tags=["hunk-review"],
+        ) as hunk_run:
+            defect_comments, defect_ids = _run_review_pass(
+                model_type="defect",
+                model_name=OLLAMA_MODEL_DEFECT,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
             )
-
-            comments, _ = _run_review_pass(
-                model_type=pass_type,
-                model_name=model_name,
-                file_path=fp,
-                hunk=h,
-                mappings=m,
-                mapping_dict=md,
-                head_sha=request.head_sha,
-                head_blob_cache=head_blob_cache,
-                skip_ids=None,
-                hunk_index=hunk_idx,
+            
+            refactor_comments, refactor_ids = _run_review_pass(
+                model_type="refactor",
+                model_name=OLLAMA_MODEL_REFACTOR,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                skip_ids=defect_ids,
             )
-
-            elapsed = _time.monotonic() - t_start
-            with _active_lock:
-                _active_tasks.discard(task_label)
-                concurrent_after = len(_active_tasks)
-                _timeline.append((_time.monotonic(), "END  ", task_label, concurrent_after))
-            logger.debug(
-                f"[PARA] ■ END    {task_label:<30} | "
-                f"elapsed={elapsed:.1f}s | "
-                f"active_remaining={concurrent_after} | "
-                f"comments={len(comments)}"
+            
+            compiler_comments, _ = _run_review_pass(
+                model_type="compiler",
+                model_name=OLLAMA_MODEL_COMPILER,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                skip_ids=defect_ids | refactor_ids,
             )
-
-            return (pass_type, hunk_idx, comments)
-
-        defect_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-        refactor_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-        compiler_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-        style_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-        total_tasks = 4 * len(hunk_items)
-        max_workers_pp = min(4 * workers, total_tasks)
-
-        with ThreadPoolExecutor(max_workers=max_workers_pp) as executor:
-            future_to_meta = {
-                executor.submit(run_pass, i, pt): (i, pt)
-                for i in range(len(hunk_items))
-                for pt in ("defect", "refactor", "compiler", "style")
-            }
-            for future in as_completed(future_to_meta):
-                hunk_idx, pass_type = future_to_meta[future]
-                try:
-                    pt, idx, comments = future.result()
-                    if pt == "defect":
-                        defect_results_pp[idx] = comments
-                    elif pt == "refactor":
-                        refactor_results_pp[idx] = comments
-                    elif pt == "style":
-                        style_results_pp[idx] = comments
-                    else:
-                        compiler_results_pp[idx] = comments
-                except Exception as e:
-                    logger.exception(f"{pass_type} pass failed for hunk {hunk_idx}: {e}")
-
-        all_github_comments = []
-        for i in range(len(hunk_items)):
+            
+            style_comments, _ = _run_review_pass(
+                model_type="style",
+                model_name=OLLAMA_MODEL_STYLE,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                skip_ids=defect_ids | refactor_ids,
+            )
+            
             merged = _merge_comments_by_line(
                 hunk_items[i],
-                defect_results_pp[i],
-                refactor_results_pp[i],
-                compiler_results_pp[i],
-                style_results_pp[i],
+                defect_comments,
+                refactor_comments,
+                compiler_comments,
+                style_comments,
             )
-            all_github_comments.extend(merged)
+            
+            hunk_run.end(outputs={
+                "comment_count": len(merged),
+                "defect_count": len(defect_comments),
+                "refactor_count": len(refactor_comments),
+                "compiler_count": len(compiler_comments),
+                "style_count": len(style_comments),
+            })
+            
+            return merged
+
+    if use_parallel_passes:
+        all_github_comments = []
+        total_tasks = len(hunk_items)
+        
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {
+                executor.submit(run_single_hunk_with_trace, i): i
+                for i in range(len(hunk_items))
+            }
+            for future in as_completed(future_to_idx):
+                hunk_idx = future_to_idx[future]
+                try:
+                    merged = future.result()
+                    all_github_comments.extend(merged)
+                except Exception as e:
+                    logger.exception(f"Hunk {hunk_idx} review failed: {e}")
 
         logger.info(
-            f"[PARA] ✅ Done | total tasks={total_tasks} | "
-            f"max_concurrent={_max_concurrent[0]} | "
+            f"[PARA] ✅ Done | total hunks={total_tasks} | "
             f"generated_comments={len(all_github_comments)}"
         )
-        if _max_concurrent[0] >= 2:
-            logger.info("[PARA] 🟢 Actual parallel execution confirmed (max_concurrent >= 2)")
-        else:
-            logger.warning("[PARA] 🔴 Parallel execution unconfirmed (all tasks processed serially)")
-
-        logger.debug("[PARA] === Timeline (Chronological) ===")
-        t0 = _timeline[0][0] if _timeline else 0
-        for ts, event, label, cnt in _timeline:
-            logger.debug(f"[PARA]  +{ts - t0:6.2f}s  {event}  {label:<35}  concurrent={cnt}")
-        logger.debug("[PARA] ========================")
-        # ─────────────────────────────────────────────────────────────────────
-
-        logger.info(f"Generated {len(all_github_comments)} comments in total (parallel passes).")
+        logger.info(f"Generated {len(all_github_comments)} comments in total (parallel mode).")
         return all_github_comments
 
-    defect_results: List[Tuple[List[Dict[str, Any]], Set[int]]] = [
-        ([], set()) for _ in range(len(hunk_items))
-    ]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {executor.submit(run_defect, i): i for i in range(len(hunk_items))}
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                defect_results[idx] = future.result()
-            except Exception as e:
-                logger.exception(f"Defect pass failed for hunk {idx}: {e}")
-
-    refactor_results: List[Tuple[List[Dict[str, Any]], Set[int]]] = [
-        ([], set()) for _ in range(len(hunk_items))
-    ]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {
-            executor.submit(run_refactor, i, defect_results[i][1]): i
-            for i in range(len(hunk_items))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                refactor_results[idx] = future.result()
-            except Exception as e:
-                logger.exception(f"Refactor pass failed for hunk {idx}: {e}")
-
-    compiler_results: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {
-            executor.submit(run_compiler, i, defect_results[i][1] | refactor_results[i][1]): i
-            for i in range(len(hunk_items))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                comments, _ = future.result()
-                compiler_results[idx] = comments
-            except Exception as e:
-                logger.exception(f"Compiler pass failed for hunk {idx}: {e}")
-
-    style_results: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {
-            executor.submit(run_style, i, defect_results[i][1] | refactor_results[i][1] | set() ): i
-            # Not using compiler_results[i][1] since compiler doesn't return accepted IDs in this simplified logic, 
-            # wait, run_compiler DOES return accepted IDs in _run_review_pass? 
-            # Ah, the logic for compiler_results was previously just [[] for _ in range(...)], meaning (comments, _) was ignored.
-            # I will just skip IDs from defect & refactor to keep it simple and match original flow.
-            for i in range(len(hunk_items))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                comments, _ = future.result()
-                style_results[idx] = comments
-            except Exception as e:
-                logger.exception(f"Style pass failed for hunk {idx}: {e}")
-
+    # Sequential mode: process each hunk with trace
     all_github_comments = []
     for i in range(len(hunk_items)):
-        all_github_comments.extend(defect_results[i][0])
-        all_github_comments.extend(refactor_results[i][0])
-        all_github_comments.extend(compiler_results[i])
-        all_github_comments.extend(style_results[i])
+        try:
+            merged = run_single_hunk_with_trace(i)
+            all_github_comments.extend(merged)
+        except Exception as e:
+            logger.exception(f"Hunk {i} review failed: {e}")
 
-    logger.info(f"Generated {len(all_github_comments)} comments in total.")
+    logger.info(f"Generated {len(all_github_comments)} comments in total (sequential mode).")
     return all_github_comments
 
