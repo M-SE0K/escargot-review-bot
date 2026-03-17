@@ -359,13 +359,7 @@ def _run_review_pass(
     chain = build_review_chain(model_type, model=model_name)
     
     try:
-        with ls.trace(
-            name=f"{model_type} pass",
-            run_type="chain",
-            metadata={"pass_type": model_type, "model": model_name},
-            tags=[f"pass:{model_type}"],
-        ):
-            comments = chain.invoke(chain_input)
+        comments = chain.invoke(chain_input)
     except Exception as e:
         logger.error(f"{model_type} pass: chain invoke failed: {e}")
         return [], set()
@@ -494,17 +488,11 @@ def _merge_comments_by_line(
         logger.debug(f"Judge pass starting for {info['path']}:{info['line']} (proposals: {len(parts)})")
         
         try:
-            with ls.trace(
-                name=f"judge L{info['line']}",
-                run_type="chain",
-                metadata={"pass_type": "judge", "line": info["line"], "proposal_count": len(parts)},
-                tags=["pass:judge"],
-            ):
-                judge_comments = judge_chain.invoke({
-                    "file_path": info["path"],
-                    "target_code": target_code,
-                    "proposals_text": proposals_text.strip(),
-                })
+            judge_comments = judge_chain.invoke({
+                "file_path": info["path"],
+                "target_code": target_code,
+                "proposals_text": proposals_text.strip(),
+            })
         except Exception as e:
             logger.error(f"Judge chain invoke failed: {e}")
             continue
@@ -528,37 +516,33 @@ def _merge_comments_by_line(
 
 
 def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
-    """End-to-end review across diff: three passes per hunk, aggregate comments.
+    """End-to-end review across diff: four passes per hunk, aggregate comments.
 
-    Fetches upstream, builds unified diff, runs defect, refactor, and compiler
-    optimization passes per hunk, applies confidence/alignment checks, and returns
+    Fetches upstream, builds unified diff, runs defect, refactor, compiler,
+    and style passes per hunk, applies confidence/alignment checks, and returns
     GitHub comments.
     
-    Wraps the entire review process in a LangSmith parent trace for organized monitoring.
+    All tracing is scoped to a PR-specific LangSmith project.
     """
+    import os
+    
     logger.info(f"Start review PR=#{request.pull_request_number} {request.base_sha}..{request.head_sha}")
     
     pr_project_name = f"escargot-review-bot/PR-{request.pull_request_number}"
     
-    with ls.tracing_context(project_name=pr_project_name):
-        with ls.trace(
-            name=f"PR Review #{request.pull_request_number}",
-            run_type="chain",
-            inputs={
-                "pr_number": request.pull_request_number,
-                "base_sha": request.base_sha[:8],
-                "head_sha": request.head_sha[:8],
-            },
-            tags=["pr-review"],
-            metadata={
-                "pr_number": request.pull_request_number,
-                "base_sha": request.base_sha,
-                "head_sha": request.head_sha,
-            },
-        ) as parent_run:
-            result = _execute_review(request)
-            parent_run.end(outputs={"comment_count": len(result)})
-            return result
+    # 환경변수를 동적으로 변경하여 LangChain 자동 트레이싱도 PR별 프로젝트로 보냄
+    old_project = os.environ.get("LANGCHAIN_PROJECT")
+    os.environ["LANGCHAIN_PROJECT"] = pr_project_name
+    
+    try:
+        with ls.tracing_context(project_name=pr_project_name):
+            return _execute_review(request)
+    finally:
+        # 원래 값 복원
+        if old_project is not None:
+            os.environ["LANGCHAIN_PROJECT"] = old_project
+        else:
+            os.environ.pop("LANGCHAIN_PROJECT", None)
 
 
 def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
@@ -649,7 +633,7 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
             return f"L{start}"
         return f"L{start}-L{end}"
 
-    def run_single_hunk_with_trace(i: int) -> List[Dict[str, Any]]:
+    def run_single_hunk(i: int) -> List[Dict[str, Any]]:
         """Run all passes for a single hunk within a unified trace."""
         fp, h, m, md = hunk_items[i]
         file_name = fp.split('/')[-1]
@@ -659,13 +643,17 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
         with ls.trace(
             name=trace_name,
             run_type="chain",
+            inputs={
+                "file_path": fp,
+                "hunk_start": h.target_start,
+                "hunk_length": h.target_length,
+            },
             metadata={
                 "file_path": fp,
                 "hunk_index": i,
                 "target_start": h.target_start,
                 "target_length": h.target_length,
             },
-            tags=["hunk-review"],
         ) as hunk_run:
             defect_comments, defect_ids = _run_review_pass(
                 model_type="defect",
@@ -716,39 +704,27 @@ def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
             
             return merged
 
+    all_github_comments: List[Dict[str, Any]] = []
+    
     if use_parallel_passes:
-        all_github_comments = []
-        total_tasks = len(hunk_items)
-        
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_idx = {
-                executor.submit(run_single_hunk_with_trace, i): i
+                executor.submit(run_single_hunk, i): i
                 for i in range(len(hunk_items))
             }
             for future in as_completed(future_to_idx):
                 hunk_idx = future_to_idx[future]
                 try:
-                    merged = future.result()
-                    all_github_comments.extend(merged)
+                    all_github_comments.extend(future.result())
                 except Exception as e:
                     logger.exception(f"Hunk {hunk_idx} review failed: {e}")
+    else:
+        for i in range(len(hunk_items)):
+            try:
+                all_github_comments.extend(run_single_hunk(i))
+            except Exception as e:
+                logger.exception(f"Hunk {i} review failed: {e}")
 
-        logger.info(
-            f"[PARA] ✅ Done | total hunks={total_tasks} | "
-            f"generated_comments={len(all_github_comments)}"
-        )
-        logger.info(f"Generated {len(all_github_comments)} comments in total (parallel mode).")
-        return all_github_comments
-
-    # Sequential mode: process each hunk with trace
-    all_github_comments = []
-    for i in range(len(hunk_items)):
-        try:
-            merged = run_single_hunk_with_trace(i)
-            all_github_comments.extend(merged)
-        except Exception as e:
-            logger.exception(f"Hunk {i} review failed: {e}")
-
-    logger.info(f"Generated {len(all_github_comments)} comments in total (sequential mode).")
+    logger.info(f"Generated {len(all_github_comments)} comments (hunks={len(hunk_items)}, parallel={use_parallel_passes}).")
     return all_github_comments
 
