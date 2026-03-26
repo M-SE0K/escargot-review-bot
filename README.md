@@ -219,3 +219,31 @@ Workflow file: `.github/workflows/code-review.yml` in `Samsung/escargot`.
   ]
 }
 ```
+
+
+
+feat: implement 4-pass parallel review pipeline with independent Judge model
+
+## Overview
+The existing sequential review pipeline has been improved by processing four different passes (Defect, Refactor, Compiler, Style) in parallel for a single diff hunk using independent models. This eliminates the legacy `skip_ids` logic—which previously skipped subsequent reviews—allowing developers to receive comprehensive feedback from a broader perspective. Additionally, multiple comments targeting the same line of code are now cleanly aggregated into a single, concise comment through the newly introduced Judge (Merge) pass.
+
+## Key Changes
+1. Multiplexing of Review Passes
+The review system, previously consisting of 2 passes (Defect, Refactor), has been expanded with the addition of Compiler, Style, and Judge passes to enable more diverse and in-depth code reviews:
+
+- **Compiler Pass**: Acts as a world-class compiler optimization expert specialized in Escargot. Focusing specifically on GCC/Clang optimization passes, it provides compiler-friendly code hints that help generate more efficient machine code and reduce memory footprint.
+
+- **Style Pass**: Proposes improvements strictly based on the guidelines documented in Escargot's `docs/Coding_Style_Guide.md`.
+
+- **Judge Pass**: When multiple review comments (from Defect, Refactor, Compiler, Style) target the same line of code, the Judge model evaluates and merges them into a concise, highly readable single comment. It determines priorities by considering the importance of each pass (Defect ≥ Compiler ≥ Refactor, Style). Notably, by employing an independent model not used in the previous passes, it prevents self-confirmation bias and provides a more objective, highly reliable final review.
+
+2. Shift to Parallel Processing & Removal of skip_ids
+The core pipeline has transitioned from sequential to parallel execution. The legacy `skip_ids` mechanism, which forced the system to skip subsequent passes if a higher-priority pass generated a comment, has been removed.
+Now, the {Defect, Refactor, Compiler, Style} passes are executed simultaneously for a given diff hunk. Once all passes generate their feedback, the Judge pass merges overlapping comments. This approach ensures developers gain maximum insight from all available review perspectives while maintaining the prioritization hierarchy during the merging phase.
+
+3. Performance Optimization & Accuracy Improvement
+Parallel processing of review passes alleviates bottlenecks and shortens overall review times. Furthermore, the Judge pass improves code review readability and reduces the number of comments developers must review by consolidating multiple comments into one.
+Despite the increased computational load from multiplexing passes and removing the `skip_ids` logic, optimizations have resulted in review times that are approximately 4~6 times faster and a 2.5x improvement in the True Positive Rate compared to the previous version.
+
+4. Improved Maintainability & Tracing via LangChain
+The underlying logic has been migrated to be based on the globally standardized LangChain framework. This intuitively improves the pipeline's structure and readability, significantly reducing the development cost of adding new review passes or scaling to different LLM providers in the future. Moreover, easier integration with tracing systems enables the systematic collection and tracking of continuously accumulated PR review data. This establishes a powerful data foundation to precisely analyze which types of software vulnerabilities or code defects the review bot misses, allowing for continuous enhancement of the bot's performance over time.
