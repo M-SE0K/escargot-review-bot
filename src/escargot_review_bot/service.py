@@ -1,15 +1,25 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import langsmith as ls
 from fastapi import HTTPException
 from unidiff import PatchSet, Hunk
 
 from escargot_review_bot.adapters.git import run_git_command
-from escargot_review_bot.adapters.llm import chat_and_parse
+from escargot_review_bot.adapters.llm import build_review_chain, build_judge_chain
 from escargot_review_bot.config.config import (
     ALIGN_SEARCH_WINDOW,
     CONFIDENCE_THRESHOLD,
     DIFF_CONTEXT,
+    OLLAMA_KEEP_ALIVE,
+    OLLAMA_MODEL_COMPILER,
+    OLLAMA_MODEL_DEFECT,
+    OLLAMA_MODEL_JUDGE,
+    OLLAMA_MODEL_REFACTOR,
+    OLLAMA_MODEL_STYLE,
     REVIEW_INCLUDE_PATHS,
+    REVIEW_PARALLEL_PASSES,
+    REVIEW_PARALLEL_WORKERS,
 )
 from escargot_review_bot.config.logging import get_logger
 from escargot_review_bot.domain.schemas import (
@@ -17,11 +27,12 @@ from escargot_review_bot.domain.schemas import (
     LLMReviewComment,
     ReviewRequest,
 )
-from escargot_review_bot.prompts.defect import SYSTEM_PROMPT_DEFECT
-from escargot_review_bot.prompts.refactor import SYSTEM_PROMPT_REFACTOR
 
 
 logger = get_logger("review-bot.service")
+
+# Pass-type → comment tag mapping
+PASS_TAG: dict = {"defect": "[D]", "refactor": "[R]", "compiler": "[C]", "style": "[S]"}
 
 
 class LineMappingLite:
@@ -261,13 +272,12 @@ def try_nearby_align(
     return None
 
 
-def build_hunk_based_prompt(path: str, hunk: Hunk, mappings: List[LineMappingLite]) -> str:
-    """Compose a hunk review prompt including diff and Commentable Catalog.
+def prepare_chain_input(path: str, hunk: Hunk, mappings: List[LineMappingLite]) -> Dict[str, str]:
+    """Prepare input dictionary for LangChain review chains.
 
-    Catalog lists only added lines with `<ID ...>` anchors to constrain output.
-    The prompt enforces hunk-locality and a strict JSON-only response.
+    Returns a dict with keys: file_path, hunk_text, commentable_catalog
+    that can be passed directly to build_review_chain().invoke()
     """
-    # Render raw diff hunk and assemble Commentable Catalog (added lines only)
     hunk_text = str(hunk)
     commentable = [
         m for m in mappings
@@ -282,34 +292,11 @@ def build_hunk_based_prompt(path: str, hunk: Hunk, mappings: List[LineMappingLit
     else:
         commentable_str = "(no added lines)"
 
-    # Compose the strict prompt instructing JSON-only output anchored by IDs
-    return f"""
-You are a world-class C++ and JavaScript engine reviewer for the Escargot project. Your review must be strict and technically precise.
-
-## Target File: `{path}`
-## Review Task
-Your task is to review the code changes within the `DIFF HUNK` section only. Use the diff purely; do NOT comment on any line outside of the 'Commentable Catalog'.
-
-### Hard Rules
-- Choose "target_id" ONLY from **Commentable Catalog (ADDED lines only)**.
-- If no qualifying added line has an issue, return [].
-- Do NOT mention or infer any line numbers (e.g., "line 47", "at 115"). Anchor only by exact tokens from the chosen line.
-
----
-### 1. DIFF HUNK
-```diff
-{hunk_text}
-```
-
----
-### 2. Commentable Catalog (ADDED lines only; eligible IDs)
-```
-{commentable_str}
-```
-
-### Output (JSON array only)
-Each object: "target_id", "body", "confidence". If none, return [].
-""".strip()
+    return {
+        "file_path": path,
+        "hunk_text": hunk_text,
+        "commentable_catalog": commentable_str,
+    }
 
 
 def fetch_upstream_with_fallback(pull_request_number: int, base_sha: str, head_sha: str) -> None:
@@ -352,7 +339,7 @@ def fetch_upstream_with_fallback(pull_request_number: int, base_sha: str, head_s
 
 def _run_review_pass(
     model_type: str,
-    system_prompt: str,
+    model_name: str,
     file_path: str,
     hunk: Hunk,
     mappings: List[LineMappingLite],
@@ -361,37 +348,36 @@ def _run_review_pass(
     head_blob_cache: Dict[str, List[str]],
     skip_ids: Set[int] | None = None,
 ) -> Tuple[List[Dict[str, Any]], Set[int]]:
-    """Run one pass (defect/refactor): invoke LLM and post-filter results.
+    """Run one pass (defect/refactor/compiler/style) using LangChain LCEL chain.
 
-    Enforces schema validity, de-dup via `skip_ids`, confidence threshold, and
-    HEAD alignment (with nearby search). Returns comments and accepted IDs
+    Uses build_review_chain() to construct: prompt | llm | parser
+    Tracing is handled by the parent hunk-level trace.
     """
-    # Build hunk-scoped prompt and request LLM output
-    prompt = build_hunk_based_prompt(file_path, hunk, mappings)
+    chain_input = prepare_chain_input(file_path, hunk, mappings)
+    logger.debug(f"{model_type.title()} pass: model={model_name}")
+
+    chain = build_review_chain(model_type, model=model_name)
+    
     try:
-        logger.debug(f"{model_type.title()} pass: prompt length={len(prompt)}")
-    except Exception:
-        logger.debug(f"{model_type.title()} pass: prompt length=(unknown)")
+        comments = chain.invoke(chain_input)
+    except Exception as e:
+        logger.error(f"{model_type} pass: chain invoke failed: {e}")
+        return [], set()
+    
+    logger.info(f"{model_type} pass: LLM returned {len(comments)} raw comment(s)")
 
-    raw = chat_and_parse(system_prompt, prompt)
-
-    # Filter pipeline: schema -> dedup -> confidence -> mapping -> alignment
     out_comments: List[Dict[str, Any]] = []
     accepted: Set[int] = set()
 
-    for c in raw:
-        try:
-            llm_comment = LLMReviewComment(**c)
-        except Exception as e:
-            logger.debug(f"Skip({model_type}): schema invalid -> {e} | raw={c}")
-            continue
-
-        # Skip IDs already accepted in the other pass (dedup across passes)
+    for llm_comment in comments:
         if skip_ids and llm_comment.target_id in skip_ids:
             logger.debug(f"Skip({model_type}): already accepted id={llm_comment.target_id}")
             continue
 
-        # Enforce minimum confidence threshold (LLM produces the value)
+        if llm_comment.target_id in accepted:
+            logger.debug(f"Skip({model_type}): duplicate target_id={llm_comment.target_id} in this pass")
+            continue
+
         if llm_comment.confidence < CONFIDENCE_THRESHOLD:
             logger.debug(f"Skip({model_type}): low confidence {llm_comment.confidence:.2f} < {CONFIDENCE_THRESHOLD}")
             continue
@@ -404,9 +390,7 @@ def _run_review_pass(
         line_no = m.target_line_no
         head_ok = assert_head_alignment(head_sha, file_path, m, head_blob_cache)
         if head_ok is False:
-            # Try to locate the same line content nearby if exact slot changed
             logger.debug(f"Align mismatch at ~{line_no}, trying nearby align...")
-            # Build small neighbor context around the target line within the hunk
             try:
                 center_index = next(i for i, mm in enumerate(mappings) if mm.target_id == m.target_id)
             except StopIteration:
@@ -429,9 +413,10 @@ def _run_review_pass(
                 continue
             line_no = aligned
 
+        tag = PASS_TAG.get(model_type, "")
         final_comment = GitHubComment(
             path=file_path,
-            body=llm_comment.body,
+            body=f"{tag} {llm_comment.body}" if tag else llm_comment.body,
             commit_id=head_sha,
             line=line_no,
             side="RIGHT"
@@ -440,17 +425,128 @@ def _run_review_pass(
         accepted.add(llm_comment.target_id)
         logger.debug(f"Accept({model_type}): id={llm_comment.target_id} -> line={line_no}")
 
+    if len(comments) > 0 and len(out_comments) == 0:
+        logger.warning(
+            f"{model_type} pass: all {len(comments)} comment(s) dropped by filters "
+            "(confidence/target_id/HEAD alignment). Check LOG_LEVEL=DEBUG for Skip reasons."
+        )
     return out_comments, accepted
 
 
+_PASS_ORDER = ("defect", "refactor", "compiler", "style")
+
+def _merge_comments_by_line(
+    hunk_item: Tuple[str, Hunk, List[LineMappingLite], Dict[int, Any]],
+    defect_comments: List[Dict[str, Any]],
+    refactor_comments: List[Dict[str, Any]],
+    compiler_comments: List[Dict[str, Any]],
+    style_comments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Groups by (path, line). Uses Judge chain to merge multiple pass comments."""
+    fp, h, m, mapping_dict = hunk_item
+    key_to_bodies: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for label, comments in [
+        ("defect", defect_comments),
+        ("refactor", refactor_comments),
+        ("compiler", compiler_comments),
+        ("style", style_comments),
+    ]:
+        for c in comments:
+            path = c.get("path", "")
+            line = c.get("line")
+            if line is None:
+                continue
+            key = (path, line)
+            if key not in key_to_bodies:
+                key_to_bodies[key] = {"path": path, "line": line, "commit_id": c.get("commit_id"), "side": c.get("side", "RIGHT"), "parts": []}
+            body = (c.get("body") or "").strip()
+            if body:
+                key_to_bodies[key]["parts"].append((label, body))
+                
+    merged: List[Dict[str, Any]] = []
+    judge_chain = build_judge_chain(model=OLLAMA_MODEL_JUDGE)
+    
+    for key in sorted(key_to_bodies.keys()):
+        info = key_to_bodies[key]
+        parts = info["parts"]
+        if not parts:
+            continue
+            
+        target_code = "(Failed to map the line)"
+        for mapping in m:
+            if mapping.target_line_no == info["line"]:
+                target_code = line_without_prefix(mapping.content).strip()
+                break
+
+        order_idx = {p: i for i, p in enumerate(_PASS_ORDER)}
+        parts_sorted = sorted(parts, key=lambda x: order_idx.get(x[0], 99))
+        
+        proposals_text = ""
+        for p_label, b_text in parts_sorted:
+            proposals_text += f"[{p_label.upper()}]\n{b_text}\n\n"
+            
+        logger.debug(f"Judge pass starting for {info['path']}:{info['line']} (proposals: {len(parts)})")
+        
+        try:
+            judge_comments = judge_chain.invoke({
+                "file_path": info["path"],
+                "target_code": target_code,
+                "proposals_text": proposals_text.strip(),
+            })
+        except Exception as e:
+            logger.error(f"Judge chain invoke failed: {e}")
+            continue
+        
+        if not judge_comments:
+            logger.debug(f"Judge pass rejected proposals for {info['line']}.")
+            continue
+            
+        judged_comment = judge_comments[0].body.strip()
+        if not judged_comment:
+            continue
+
+        merged.append({
+            "path": info["path"],
+            "body": judged_comment,
+            "commit_id": info["commit_id"],
+            "line": info["line"],
+            "side": info["side"],
+        })
+    return merged
+
+
 def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
-    """End-to-end review across diff: two passes per hunk, aggregate comments.
+    """End-to-end review across diff: four passes per hunk, aggregate comments.
 
-    Fetches upstream, builds unified diff, runs defect then refactor passes per
-    hunk, applies confidence/alignment checks, and returns GitHub comments.
+    Fetches upstream, builds unified diff, runs defect, refactor, compiler,
+    and style passes per hunk, applies confidence/alignment checks, and returns
+    GitHub comments.
+    
+    All tracing is scoped to a PR-specific LangSmith project.
     """
+    import os
+    
     logger.info(f"Start review PR=#{request.pull_request_number} {request.base_sha}..{request.head_sha}")
+    
+    pr_project_name = f"escargot-review-bot/PR-{request.pull_request_number}"
+    
+    # 환경변수를 동적으로 변경하여 LangChain 자동 트레이싱도 PR별 프로젝트로 보냄
+    old_project = os.environ.get("LANGCHAIN_PROJECT")
+    os.environ["LANGCHAIN_PROJECT"] = pr_project_name
+    
+    try:
+        with ls.tracing_context(project_name=pr_project_name):
+            return _execute_review(request)
+    finally:
+        # 원래 값 복원
+        if old_project is not None:
+            os.environ["LANGCHAIN_PROJECT"] = old_project
+        else:
+            os.environ.pop("LANGCHAIN_PROJECT", None)
 
+
+def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
+    """Internal implementation of the review logic."""
     # Fetch upstream refs and ensure base/head SHAs are available locally
     logger.info("Fetching latest data from upstream...")
     fetch_upstream_with_fallback(request.pull_request_number, request.base_sha, request.head_sha)
@@ -476,59 +572,159 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
         logger.exception(f"Diff parse failed: {e}")
         return []
 
-    # Accumulate comments; cache HEAD blobs by "{sha}:{path}"
-    all_github_comments: List[Dict[str, Any]] = []
     head_blob_cache: Dict[str, List[str]] = {}
-
     for patched_file in patch_set:
         file_path = patched_file.path
         if not any(file_path.startswith(p) for p in REVIEW_INCLUDE_PATHS):
             continue
-        logger.info(f"Processing file: {file_path}")
-
-        for hunk in patched_file:
+        key = f"{request.head_sha}:{file_path}"
+        if key not in head_blob_cache:
             try:
-                logger.debug(f"Hunk {file_path}: -{hunk.source_start},{getattr(hunk, 'source_length', '?')} -> +{hunk.target_start},{getattr(hunk, 'target_length', '?')}")
-            except Exception:
-                logger.debug(f"Hunk {file_path}: (unable to summarize hunk)")
+                blob_text = run_git_command(["show", f"{request.head_sha}:{file_path}"])
+                head_blob_cache[key] = blob_text.splitlines()
+            except Exception as e:
+                logger.debug(f"Could not load blob {key}: {e}")
+                head_blob_cache[key] = []
 
-            # Build line mappings and fast index for target_id lookups
+    hunk_items: List[Tuple[str, Hunk, List[LineMappingLite], Dict[int, Any]]] = []
+    for patched_file in patch_set:
+        file_path = patched_file.path
+        if not any(file_path.startswith(p) for p in REVIEW_INCLUDE_PATHS):
+            continue
+        for hunk in patched_file:
             mappings = create_line_mappings_for_hunk(hunk)
             if not mappings:
-                logger.debug("No mappings generated; skipping hunk")
                 continue
-
             mapping_dict = {m.target_id: m for m in mappings}
-            added_count = sum(1 for m in mappings if m.line_type == 'added')
-            logger.debug(f"Mappings: total={len(mappings)}, added={added_count}")
+            hunk_items.append((file_path, hunk, mappings, mapping_dict))
 
-            # Pass 1: defects (higher severity) -> collect and mark accepted IDs
-            defect_comments, accepted_defect_ids = _run_review_pass(
-                model_type='defect',
-                system_prompt=SYSTEM_PROMPT_DEFECT,
-                file_path=file_path,
-                hunk=hunk,
-                mappings=mappings,
-                mapping_dict=mapping_dict,
-                head_sha=request.head_sha,
-                head_blob_cache=head_blob_cache,
+    if not hunk_items:
+        logger.info("No hunks to review.")
+        return []
+
+    workers = max(1, REVIEW_PARALLEL_WORKERS)
+    if OLLAMA_KEEP_ALIVE == "0" and workers > 1:
+        logger.info(
+            f"OLLAMA_KEEP_ALIVE=0: forcing workers=1 to avoid model unload race (was {workers})."
+        )
+        workers = 1
+
+    use_parallel_passes = REVIEW_PARALLEL_PASSES
+    if use_parallel_passes:
+        models_info = (
+            f"defect={OLLAMA_MODEL_DEFECT}, "
+            f"refactor={OLLAMA_MODEL_REFACTOR}, "
+            f"compiler={OLLAMA_MODEL_COMPILER}, "
+            f"style={OLLAMA_MODEL_STYLE}"
+        )
+        logger.info(
+            f"Parallel passes enabled: [{models_info}], "
+            f"{len(hunk_items)} hunks × 4 passes = {4 * len(hunk_items)} tasks, "
+            f"max_workers={min(4 * workers, 4 * len(hunk_items))}."
+        )
+    else:
+        logger.info(f"Sequential review: {len(hunk_items)} hunks, {workers} workers per pass.")
+
+    def get_hunk_line_range(hunk: Hunk) -> str:
+        """Get line range string for hunk (e.g., 'L42-L58')."""
+        start = hunk.target_start
+        end = hunk.target_start + hunk.target_length - 1
+        if start == end:
+            return f"L{start}"
+        return f"L{start}-L{end}"
+
+    def run_single_hunk(i: int) -> List[Dict[str, Any]]:
+        """Run all passes for a single hunk within a unified trace."""
+        fp, h, m, md = hunk_items[i]
+        file_name = fp.split('/')[-1]
+        line_range = get_hunk_line_range(h)
+        trace_name = f"{file_name}_{line_range}"
+        
+        with ls.trace(
+            name=trace_name,
+            run_type="chain",
+            inputs={
+                "file_path": fp,
+                "hunk_start": h.target_start,
+                "hunk_length": h.target_length,
+            },
+            metadata={
+                "file_path": fp,
+                "hunk_index": i,
+                "target_start": h.target_start,
+                "target_length": h.target_length,
+            },
+        ) as hunk_run:
+            defect_comments, defect_ids = _run_review_pass(
+                model_type="defect",
+                model_name=OLLAMA_MODEL_DEFECT,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
             )
-            all_github_comments.extend(defect_comments)
-
-            # Pass 2: refactors (skip any accepted defect IDs to avoid duplicates)
-            refactor_comments, _ = _run_review_pass(
-                model_type='refactor',
-                system_prompt=SYSTEM_PROMPT_REFACTOR,
-                file_path=file_path,
-                hunk=hunk,
-                mappings=mappings,
-                mapping_dict=mapping_dict,
-                head_sha=request.head_sha,
-                head_blob_cache=head_blob_cache,
-                skip_ids=accepted_defect_ids,
+            
+            refactor_comments, refactor_ids = _run_review_pass(
+                model_type="refactor",
+                model_name=OLLAMA_MODEL_REFACTOR,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                skip_ids=defect_ids,
             )
-            all_github_comments.extend(refactor_comments)
+            
+            compiler_comments, _ = _run_review_pass(
+                model_type="compiler",
+                model_name=OLLAMA_MODEL_COMPILER,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                skip_ids=defect_ids | refactor_ids,
+            )
+            
+            style_comments, _ = _run_review_pass(
+                model_type="style",
+                model_name=OLLAMA_MODEL_STYLE,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                skip_ids=defect_ids | refactor_ids,
+            )
+            
+            merged = _merge_comments_by_line(
+                hunk_items[i],
+                defect_comments,
+                refactor_comments,
+                compiler_comments,
+                style_comments,
+            )
+            
+            hunk_run.end(outputs={
+                "comment_count": len(merged),
+                "defect_count": len(defect_comments),
+                "refactor_count": len(refactor_comments),
+                "compiler_count": len(compiler_comments),
+                "style_count": len(style_comments),
+            })
+            
+            return merged
 
-    logger.info(f"Generated {len(all_github_comments)} comments in total.")
+    all_github_comments: List[Dict[str, Any]] = []
+    
+    if use_parallel_passes:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {
+                executor.submit(run_single_hunk, i): i
+                for i in range(len(hunk_items))
+            }
+            for future in as_completed(future_to_idx):
+                hunk_idx = future_to_idx[future]
+                try:
+                    all_github_comments.extend(future.result())
+                except Exception as e:
+                    logger.exception(f"Hunk {hunk_idx} review failed: {e}")
+    else:
+        for i in range(len(hunk_items)):
+            try:
+                all_github_comments.extend(run_single_hunk(i))
+            except Exception as e:
+                logger.exception(f"Hunk {i} review failed: {e}")
+
+    logger.info(f"Generated {len(all_github_comments)} comments (hunks={len(hunk_items)}, parallel={use_parallel_passes}).")
     return all_github_comments
 
