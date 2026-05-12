@@ -1,11 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import langsmith as ls
 from fastapi import HTTPException
 from unidiff import PatchSet, Hunk
 
 from escargot_review_bot.adapters.git import run_git_command
-from escargot_review_bot.adapters.llm import chat_and_parse
+from escargot_review_bot.adapters.llm import build_review_chain, build_judge_chain
 from escargot_review_bot.config.config import (
     ALIGN_SEARCH_WINDOW,
     CONFIDENCE_THRESHOLD,
@@ -26,11 +27,6 @@ from escargot_review_bot.domain.schemas import (
     LLMReviewComment,
     ReviewRequest,
 )
-from escargot_review_bot.prompts.defect import SYSTEM_PROMPT_DEFECT
-from escargot_review_bot.prompts.refactor import SYSTEM_PROMPT_REFACTOR
-from escargot_review_bot.prompts.compiler import SYSTEM_PROMPT_COMPILER
-from escargot_review_bot.prompts.style import SYSTEM_PROMPT_STYLE
-from escargot_review_bot.prompts.judge import SYSTEM_PROMPT_JUDGE
 
 
 logger = get_logger("review-bot.service")
@@ -276,13 +272,12 @@ def try_nearby_align(
     return None
 
 
-def build_hunk_based_prompt(path: str, hunk: Hunk, mappings: List[LineMappingLite]) -> str:
-    """Compose a hunk review prompt including diff and Commentable Catalog.
+def prepare_chain_input(path: str, hunk: Hunk, mappings: List[LineMappingLite]) -> Dict[str, str]:
+    """Prepare input dictionary for LangChain review chains.
 
-    Catalog lists only added lines with `<ID ...>` anchors to constrain output.
-    The prompt enforces hunk-locality and a strict JSON-only response.
+    Returns a dict with keys: file_path, hunk_text, commentable_catalog
+    that can be passed directly to build_review_chain().invoke()
     """
-    # Render raw diff hunk and assemble Commentable Catalog (added lines only)
     hunk_text = str(hunk)
     commentable = [
         m for m in mappings
@@ -297,34 +292,11 @@ def build_hunk_based_prompt(path: str, hunk: Hunk, mappings: List[LineMappingLit
     else:
         commentable_str = "(no added lines)"
 
-    # Compose the strict prompt instructing JSON-only output anchored by IDs
-    return f"""
-You are a world-class C++ and JavaScript engine reviewer for the Escargot project. Your review must be strict and technically precise.
-
-## Target File: `{path}`
-## Review Task
-Your task is to review the code changes within the `DIFF HUNK` section only. Use the diff purely; do NOT comment on any line outside of the 'Commentable Catalog'.
-
-### Hard Rules
-- Choose "target_id" ONLY from **Commentable Catalog (ADDED lines only)**.
-- If no qualifying added line has an issue, return [].
-- Do NOT mention or infer any line numbers (e.g., "line 47", "at 115"). Anchor only by exact tokens from the chosen line.
-
----
-### 1. DIFF HUNK
-```diff
-{hunk_text}
-```
-
----
-### 2. Commentable Catalog (ADDED lines only; eligible IDs)
-```
-{commentable_str}
-```
-
-### Output (JSON array only)
-Each object: "target_id", "body", "confidence". If none, return [].
-""".strip()
+    return {
+        "file_path": path,
+        "hunk_text": hunk_text,
+        "commentable_catalog": commentable_str,
+    }
 
 
 def fetch_upstream_with_fallback(pull_request_number: int, base_sha: str, head_sha: str) -> None:
@@ -368,7 +340,6 @@ def fetch_upstream_with_fallback(pull_request_number: int, base_sha: str, head_s
 def _run_review_pass(
     model_type: str,
     model_name: str,
-    system_prompt: str,
     file_path: str,
     hunk: Hunk,
     mappings: List[LineMappingLite],
@@ -377,42 +348,36 @@ def _run_review_pass(
     head_blob_cache: Dict[str, List[str]],
     skip_ids: Set[int] | None = None,
 ) -> Tuple[List[Dict[str, Any]], Set[int]]:
-    """Run one pass (defect/refactor/compiler): invoke LLM and post-filter results.
+    """Run one pass (defect/refactor/compiler/style) using LangChain LCEL chain.
 
-    model_name: Ollama model for this pass (Setup B++: sequential Load -> Run -> Unload).
+    Uses build_review_chain() to construct: prompt | llm | parser
+    Tracing is handled by the parent hunk-level trace.
     """
-    prompt = build_hunk_based_prompt(file_path, hunk, mappings)
+    chain_input = prepare_chain_input(file_path, hunk, mappings)
+    logger.debug(f"{model_type.title()} pass: model={model_name}")
+
+    chain = build_review_chain(model_type, model=model_name)
+    
     try:
-        logger.debug(f"{model_type.title()} pass: model={model_name} prompt length={len(prompt)}")
-    except Exception:
-        logger.debug(f"{model_type.title()} pass: model={model_name}")
+        comments = chain.invoke(chain_input)
+    except Exception as e:
+        logger.error(f"{model_type} pass: chain invoke failed: {e}")
+        return [], set()
+    
+    logger.info(f"{model_type} pass: LLM returned {len(comments)} raw comment(s)")
 
-    raw = chat_and_parse(system_prompt, prompt, model=model_name)
-    logger.info(f"{model_type} pass: LLM returned {len(raw)} raw comment(s)")
-
-    # Filter pipeline: schema -> dedup -> confidence -> mapping -> alignment
     out_comments: List[Dict[str, Any]] = []
     accepted: Set[int] = set()
 
-    for c in raw:
-        try:
-            llm_comment = LLMReviewComment(**c)
-        except Exception as e:
-            keys = list(c.keys()) if isinstance(c, dict) else "n/a"
-            logger.debug(f"Skip({model_type}): schema invalid -> {e} | keys={keys} | raw={c}")
-            continue
-
-        # Skip IDs already accepted in a previous pass (dedup across passes)
+    for llm_comment in comments:
         if skip_ids and llm_comment.target_id in skip_ids:
             logger.debug(f"Skip({model_type}): already accepted id={llm_comment.target_id}")
             continue
 
-        # Same-pass dedup: one comment per line per pass
         if llm_comment.target_id in accepted:
             logger.debug(f"Skip({model_type}): duplicate target_id={llm_comment.target_id} in this pass")
             continue
 
-        # Enforce minimum confidence threshold (LLM produces the value)
         if llm_comment.confidence < CONFIDENCE_THRESHOLD:
             logger.debug(f"Skip({model_type}): low confidence {llm_comment.confidence:.2f} < {CONFIDENCE_THRESHOLD}")
             continue
@@ -425,9 +390,7 @@ def _run_review_pass(
         line_no = m.target_line_no
         head_ok = assert_head_alignment(head_sha, file_path, m, head_blob_cache)
         if head_ok is False:
-            # Try to locate the same line content nearby if exact slot changed
             logger.debug(f"Align mismatch at ~{line_no}, trying nearby align...")
-            # Build small neighbor context around the target line within the hunk
             try:
                 center_index = next(i for i, mm in enumerate(mappings) if mm.target_id == m.target_id)
             except StopIteration:
@@ -462,10 +425,10 @@ def _run_review_pass(
         accepted.add(llm_comment.target_id)
         logger.debug(f"Accept({model_type}): id={llm_comment.target_id} -> line={line_no}")
 
-    if len(raw) > 0 and len(out_comments) == 0:
+    if len(comments) > 0 and len(out_comments) == 0:
         logger.warning(
-            f"{model_type} pass: all {len(raw)} comment(s) dropped by filters "
-            "(schema/confidence/target_id/HEAD alignment). Check LOG_LEVEL=DEBUG for Skip reasons."
+            f"{model_type} pass: all {len(comments)} comment(s) dropped by filters "
+            "(confidence/target_id/HEAD alignment). Check LOG_LEVEL=DEBUG for Skip reasons."
         )
     return out_comments, accepted
 
@@ -479,7 +442,7 @@ def _merge_comments_by_line(
     compiler_comments: List[Dict[str, Any]],
     style_comments: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Groups by (path, line). If there are multiple pass comments on the same line, merges them into a single comment using the Judge model."""
+    """Groups by (path, line). Uses Judge chain to merge multiple pass comments."""
     fp, h, m, mapping_dict = hunk_item
     key_to_bodies: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for label, comments in [
@@ -501,20 +464,20 @@ def _merge_comments_by_line(
                 key_to_bodies[key]["parts"].append((label, body))
                 
     merged: List[Dict[str, Any]] = []
+    judge_chain = build_judge_chain(model=OLLAMA_MODEL_JUDGE)
+    
     for key in sorted(key_to_bodies.keys()):
         info = key_to_bodies[key]
         parts = info["parts"]
         if not parts:
             continue
             
-        # Extract target code content
         target_code = "(Failed to map the line)"
         for mapping in m:
             if mapping.target_line_no == info["line"]:
                 target_code = line_without_prefix(mapping.content).strip()
                 break
 
-        # Sort by pass order and generate prompt
         order_idx = {p: i for i, p in enumerate(_PASS_ORDER)}
         parts_sorted = sorted(parts, key=lambda x: order_idx.get(x[0], 99))
         
@@ -522,21 +485,23 @@ def _merge_comments_by_line(
         for p_label, b_text in parts_sorted:
             proposals_text += f"[{p_label.upper()}]\n{b_text}\n\n"
             
-        judge_prompt = f"## Target File: `{info['path']}`\n## Target Line: `{target_code}`\n\n## Proposals:\n{proposals_text.strip()}"
-        
         logger.debug(f"Judge pass starting for {info['path']}:{info['line']} (proposals: {len(parts)})")
         
-        raw = chat_and_parse(
-            SYSTEM_PROMPT_JUDGE,
-            judge_prompt,
-            model=OLLAMA_MODEL_JUDGE
-        )
+        try:
+            judge_comments = judge_chain.invoke({
+                "file_path": info["path"],
+                "target_code": target_code,
+                "proposals_text": proposals_text.strip(),
+            })
+        except Exception as e:
+            logger.error(f"Judge chain invoke failed: {e}")
+            continue
         
-        if not raw or len(raw) == 0:
+        if not judge_comments:
             logger.debug(f"Judge pass rejected proposals for {info['line']}.")
             continue
             
-        judged_comment = raw[0].get("body", "").strip()
+        judged_comment = judge_comments[0].body.strip()
         if not judged_comment:
             continue
 
@@ -551,14 +516,37 @@ def _merge_comments_by_line(
 
 
 def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
-    """End-to-end review across diff: three passes per hunk, aggregate comments.
+    """End-to-end review across diff: four passes per hunk, aggregate comments.
 
-    Fetches upstream, builds unified diff, runs defect, refactor, and compiler
-    optimization passes per hunk, applies confidence/alignment checks, and returns
+    Fetches upstream, builds unified diff, runs defect, refactor, compiler,
+    and style passes per hunk, applies confidence/alignment checks, and returns
     GitHub comments.
+    
+    All tracing is scoped to a PR-specific LangSmith project.
     """
+    import os
+    
     logger.info(f"Start review PR=#{request.pull_request_number} {request.base_sha}..{request.head_sha}")
+    
+    pr_project_name = f"escargot-review-bot/PR-{request.pull_request_number}"
+    
+    # 환경변수를 동적으로 변경하여 LangChain 자동 트레이싱도 PR별 프로젝트로 보냄
+    old_project = os.environ.get("LANGCHAIN_PROJECT")
+    os.environ["LANGCHAIN_PROJECT"] = pr_project_name
+    
+    try:
+        with ls.tracing_context(project_name=pr_project_name):
+            return _execute_review(request)
+    finally:
+        # 원래 값 복원
+        if old_project is not None:
+            os.environ["LANGCHAIN_PROJECT"] = old_project
+        else:
+            os.environ.pop("LANGCHAIN_PROJECT", None)
 
+
+def _execute_review(request: ReviewRequest) -> List[Dict[str, Any]]:
+    """Internal implementation of the review logic."""
     # Fetch upstream refs and ensure base/head SHAs are available locally
     logger.info("Fetching latest data from upstream...")
     fetch_upstream_with_fallback(request.pull_request_number, request.base_sha, request.head_sha)
@@ -637,253 +625,106 @@ def generate_review_comments(request: ReviewRequest) -> List[Dict[str, Any]]:
     else:
         logger.info(f"Sequential review: {len(hunk_items)} hunks, {workers} workers per pass.")
 
-    def run_defect(i: int) -> Tuple[List[Dict[str, Any]], Set[int]]:
+    def get_hunk_line_range(hunk: Hunk) -> str:
+        """Get line range string for hunk (e.g., 'L42-L58')."""
+        start = hunk.target_start
+        end = hunk.target_start + hunk.target_length - 1
+        if start == end:
+            return f"L{start}"
+        return f"L{start}-L{end}"
+
+    def run_single_hunk(i: int) -> List[Dict[str, Any]]:
+        """Run all passes for a single hunk within a unified trace."""
         fp, h, m, md = hunk_items[i]
-        return _run_review_pass(
-            model_type="defect",
-            model_name=OLLAMA_MODEL_DEFECT,
-            system_prompt=SYSTEM_PROMPT_DEFECT,
-            file_path=fp,
-            hunk=h,
-            mappings=m,
-            mapping_dict=md,
-            head_sha=request.head_sha,
-            head_blob_cache=head_blob_cache,
-        )
-
-    def run_refactor(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
-        fp, h, m, md = hunk_items[i]
-        return _run_review_pass(
-            model_type="refactor",
-            model_name=OLLAMA_MODEL_REFACTOR,
-            system_prompt=SYSTEM_PROMPT_REFACTOR,
-            file_path=fp,
-            hunk=h,
-            mappings=m,
-            mapping_dict=md,
-            head_sha=request.head_sha,
-            head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
-        )
-
-    def run_compiler(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
-        fp, h, m, md = hunk_items[i]
-        return _run_review_pass(
-            model_type="compiler",
-            model_name=OLLAMA_MODEL_COMPILER,
-            system_prompt=SYSTEM_PROMPT_COMPILER,
-            file_path=fp,
-            hunk=h,
-            mappings=m,
-            mapping_dict=md,
-            head_sha=request.head_sha,
-            head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
-        )
-
-    def run_style(i: int, skip_ids: Set[int]) -> Tuple[List[Dict[str, Any]], Set[int]]:
-        fp, h, m, md = hunk_items[i]
-        return _run_review_pass(
-            model_type="style",
-            model_name=OLLAMA_MODEL_STYLE,
-            system_prompt=SYSTEM_PROMPT_STYLE,
-            file_path=fp,
-            hunk=h,
-            mappings=m,
-            mapping_dict=md,
-            head_sha=request.head_sha,
-            head_blob_cache=head_blob_cache,
-            skip_ids=skip_ids,
-        )
-
-
-    if use_parallel_passes:
-        import threading as _threading
-        import time as _time
-        _active_lock = _threading.Lock()
-        _active_tasks: set = set()          
-        _max_concurrent: list = [0]        
-        _timeline: list = []                
-
-        def run_pass(hunk_idx: int, pass_type: str) -> Tuple[str, int, List[Dict[str, Any]]]:
-            fp, h, m, md = hunk_items[hunk_idx]
-            if pass_type == "defect":
-                model_name, system_prompt = OLLAMA_MODEL_DEFECT, SYSTEM_PROMPT_DEFECT
-            elif pass_type == "refactor":
-                model_name, system_prompt = OLLAMA_MODEL_REFACTOR, SYSTEM_PROMPT_REFACTOR
-            elif pass_type == "style":
-                model_name, system_prompt = OLLAMA_MODEL_STYLE, SYSTEM_PROMPT_STYLE
-            else:
-                model_name, system_prompt = OLLAMA_MODEL_COMPILER, SYSTEM_PROMPT_COMPILER
-
-            task_label = f"{pass_type}/hunk={hunk_idx}"
-
-            t_start = _time.monotonic()
-            with _active_lock:
-                _active_tasks.add(task_label)
-                concurrent_now = len(_active_tasks)
-                if concurrent_now > _max_concurrent[0]:
-                    _max_concurrent[0] = concurrent_now
-                snapshot = sorted(_active_tasks)
-                _timeline.append((_time.monotonic(), "START", task_label, concurrent_now))
-            logger.debug(
-                f"[PARA] ▶ START  {task_label:<30} | "
-                f"concurrent={concurrent_now} | "
-                f"active: {snapshot}"
+        file_name = fp.split('/')[-1]
+        line_range = get_hunk_line_range(h)
+        trace_name = f"{file_name}_{line_range}"
+        
+        with ls.trace(
+            name=trace_name,
+            run_type="chain",
+            inputs={
+                "file_path": fp,
+                "hunk_start": h.target_start,
+                "hunk_length": h.target_length,
+            },
+            metadata={
+                "file_path": fp,
+                "hunk_index": i,
+                "target_start": h.target_start,
+                "target_length": h.target_length,
+            },
+        ) as hunk_run:
+            defect_comments, defect_ids = _run_review_pass(
+                model_type="defect",
+                model_name=OLLAMA_MODEL_DEFECT,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
             )
-
-            comments, _ = _run_review_pass(
-                model_type=pass_type,
-                model_name=model_name,
-                system_prompt=system_prompt,
-                file_path=fp,
-                hunk=h,
-                mappings=m,
-                mapping_dict=md,
-                head_sha=request.head_sha,
-                head_blob_cache=head_blob_cache,
-                skip_ids=None,
+            
+            refactor_comments, refactor_ids = _run_review_pass(
+                model_type="refactor",
+                model_name=OLLAMA_MODEL_REFACTOR,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                skip_ids=defect_ids,
             )
-
-            elapsed = _time.monotonic() - t_start
-            with _active_lock:
-                _active_tasks.discard(task_label)
-                concurrent_after = len(_active_tasks)
-                _timeline.append((_time.monotonic(), "END  ", task_label, concurrent_after))
-            logger.debug(
-                f"[PARA] ■ END    {task_label:<30} | "
-                f"elapsed={elapsed:.1f}s | "
-                f"active_remaining={concurrent_after} | "
-                f"comments={len(comments)}"
+            
+            compiler_comments, _ = _run_review_pass(
+                model_type="compiler",
+                model_name=OLLAMA_MODEL_COMPILER,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                skip_ids=defect_ids | refactor_ids,
             )
-
-            return (pass_type, hunk_idx, comments)
-
-        defect_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-        refactor_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-        compiler_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-        style_results_pp: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-        total_tasks = 4 * len(hunk_items)
-        max_workers_pp = min(4 * workers, total_tasks)
-
-        with ThreadPoolExecutor(max_workers=max_workers_pp) as executor:
-            future_to_meta = {
-                executor.submit(run_pass, i, pt): (i, pt)
-                for i in range(len(hunk_items))
-                for pt in ("defect", "refactor", "compiler", "style")
-            }
-            for future in as_completed(future_to_meta):
-                hunk_idx, pass_type = future_to_meta[future]
-                try:
-                    pt, idx, comments = future.result()
-                    if pt == "defect":
-                        defect_results_pp[idx] = comments
-                    elif pt == "refactor":
-                        refactor_results_pp[idx] = comments
-                    elif pt == "style":
-                        style_results_pp[idx] = comments
-                    else:
-                        compiler_results_pp[idx] = comments
-                except Exception as e:
-                    logger.exception(f"{pass_type} pass failed for hunk {hunk_idx}: {e}")
-
-        all_github_comments = []
-        for i in range(len(hunk_items)):
+            
+            style_comments, _ = _run_review_pass(
+                model_type="style",
+                model_name=OLLAMA_MODEL_STYLE,
+                file_path=fp, hunk=h, mappings=m, mapping_dict=md,
+                head_sha=request.head_sha, head_blob_cache=head_blob_cache,
+                skip_ids=defect_ids | refactor_ids,
+            )
+            
             merged = _merge_comments_by_line(
                 hunk_items[i],
-                defect_results_pp[i],
-                refactor_results_pp[i],
-                compiler_results_pp[i],
-                style_results_pp[i],
+                defect_comments,
+                refactor_comments,
+                compiler_comments,
+                style_comments,
             )
-            all_github_comments.extend(merged)
+            
+            hunk_run.end(outputs={
+                "comment_count": len(merged),
+                "defect_count": len(defect_comments),
+                "refactor_count": len(refactor_comments),
+                "compiler_count": len(compiler_comments),
+                "style_count": len(style_comments),
+            })
+            
+            return merged
 
-        logger.info(
-            f"[PARA] ✅ Done | total tasks={total_tasks} | "
-            f"max_concurrent={_max_concurrent[0]} | "
-            f"generated_comments={len(all_github_comments)}"
-        )
-        if _max_concurrent[0] >= 2:
-            logger.info("[PARA] 🟢 Actual parallel execution confirmed (max_concurrent >= 2)")
-        else:
-            logger.warning("[PARA] 🔴 Parallel execution unconfirmed (all tasks processed serially)")
-
-        logger.debug("[PARA] === Timeline (Chronological) ===")
-        t0 = _timeline[0][0] if _timeline else 0
-        for ts, event, label, cnt in _timeline:
-            logger.debug(f"[PARA]  +{ts - t0:6.2f}s  {event}  {label:<35}  concurrent={cnt}")
-        logger.debug("[PARA] ========================")
-        # ─────────────────────────────────────────────────────────────────────
-
-        logger.info(f"Generated {len(all_github_comments)} comments in total (parallel passes).")
-        return all_github_comments
-
-    defect_results: List[Tuple[List[Dict[str, Any]], Set[int]]] = [
-        ([], set()) for _ in range(len(hunk_items))
-    ]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {executor.submit(run_defect, i): i for i in range(len(hunk_items))}
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
+    all_github_comments: List[Dict[str, Any]] = []
+    
+    if use_parallel_passes:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {
+                executor.submit(run_single_hunk, i): i
+                for i in range(len(hunk_items))
+            }
+            for future in as_completed(future_to_idx):
+                hunk_idx = future_to_idx[future]
+                try:
+                    all_github_comments.extend(future.result())
+                except Exception as e:
+                    logger.exception(f"Hunk {hunk_idx} review failed: {e}")
+    else:
+        for i in range(len(hunk_items)):
             try:
-                defect_results[idx] = future.result()
+                all_github_comments.extend(run_single_hunk(i))
             except Exception as e:
-                logger.exception(f"Defect pass failed for hunk {idx}: {e}")
+                logger.exception(f"Hunk {i} review failed: {e}")
 
-    refactor_results: List[Tuple[List[Dict[str, Any]], Set[int]]] = [
-        ([], set()) for _ in range(len(hunk_items))
-    ]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {
-            executor.submit(run_refactor, i, defect_results[i][1]): i
-            for i in range(len(hunk_items))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                refactor_results[idx] = future.result()
-            except Exception as e:
-                logger.exception(f"Refactor pass failed for hunk {idx}: {e}")
-
-    compiler_results: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {
-            executor.submit(run_compiler, i, defect_results[i][1] | refactor_results[i][1]): i
-            for i in range(len(hunk_items))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                comments, _ = future.result()
-                compiler_results[idx] = comments
-            except Exception as e:
-                logger.exception(f"Compiler pass failed for hunk {idx}: {e}")
-
-    style_results: List[List[Dict[str, Any]]] = [[] for _ in range(len(hunk_items))]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_idx = {
-            executor.submit(run_style, i, defect_results[i][1] | refactor_results[i][1] | set() ): i
-            # Not using compiler_results[i][1] since compiler doesn't return accepted IDs in this simplified logic, 
-            # wait, run_compiler DOES return accepted IDs in _run_review_pass? 
-            # Ah, the logic for compiler_results was previously just [[] for _ in range(...)], meaning (comments, _) was ignored.
-            # I will just skip IDs from defect & refactor to keep it simple and match original flow.
-            for i in range(len(hunk_items))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                comments, _ = future.result()
-                style_results[idx] = comments
-            except Exception as e:
-                logger.exception(f"Style pass failed for hunk {idx}: {e}")
-
-    all_github_comments = []
-    for i in range(len(hunk_items)):
-        all_github_comments.extend(defect_results[i][0])
-        all_github_comments.extend(refactor_results[i][0])
-        all_github_comments.extend(compiler_results[i])
-        all_github_comments.extend(style_results[i])
-
-    logger.info(f"Generated {len(all_github_comments)} comments in total.")
+    logger.info(f"Generated {len(all_github_comments)} comments (hunks={len(hunk_items)}, parallel={use_parallel_passes}).")
     return all_github_comments
 
